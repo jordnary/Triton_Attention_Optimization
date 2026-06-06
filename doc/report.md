@@ -4,41 +4,18 @@
 
 ## 1. 实验设置
 
-### 1.1 实验目标
-
-本实验围绕 PixArt-Alpha Text-to-Image 推理中的 self-attention 计算进行实现与优化。实验主要完成以下四类 attention 后端：
+本实验实现并评估了以下 Attention 后端：
 
 - Vanilla Attention：使用 PyTorch 张量运算实现标准 scaled dot-product attention。
 - Triton Flash Attention 2：使用 Triton 实现 forward-only 的分块 dense attention。
-- Block-Sparse Attention：使用 PyTorch 做 block selection，并使用 Triton kernel 只计算被选中的 K/V blocks。
-- Sparse Int8 Attention：在 block-sparse attention 的基础上，对 Q/K 做 per-block int8 量化，V 保持 fp16。
-
-实验包括两部分：任务 1 将不同 attention 后端接入 PixArt-Alpha，比较生成质量与采样时间；任务 2 使用独立 benchmark 脚本评估速度、CosSim、RelL1 和 RMSE。
-
-### 1.2 硬件与软件环境
+- Block-Sparse Attention：使用 block selection 选择 K/V blocks，并使用 Triton kernel 计算稀疏 attention。
+- Sparse Int8 Attention：在 block-sparse attention 基础上，对 Q/K 做 per-block int8 量化，V 保持 fp16。
 
 | 项目 | 配置 |
 |---|---|
-| 操作系统 | Windows |
-| 运行环境 | Miniconda `na` |
-| GPU | CUDA-capable GPU |
-| Python | 3.11.15 |
-| PyTorch | 2.12.0+cu130 |
 | Triton | 3.4.0 |
-| CUDA runtime | 13.0 |
-| T2I 模型 | PixArt-Alpha |
-| 推理设置 | image size 1024, DPM-Solver, 20 steps, batch size 1, fp16 |
-| Prompt 设置 | 使用 20 个预提取 T5 embeddings |
-
-### 1.3 实现概述
-
-Vanilla Attention 直接计算 `QK^T / sqrt(d)`，再执行 softmax 和 `attn @ V`。该实现数值上与 SDPA 接近，但需要显式生成完整 attention matrix，因此显存访问和计算开销较高。
-
-Triton Flash Attention 2 使用二维 grid，每个 program 负责一个 Q block。kernel 分块扫描 K/V blocks，并使用 online softmax 维护最大值、归一化因子和累积输出，从而避免显式保存完整的 `N x N` score 矩阵。实现中使用 `exp2`，并将 `1/ln(2)` 合入缩放系数；对于非 2 的幂的 head dimension 使用 mask 处理。
-
-Block-Sparse Attention 首先将 Q/K 沿序列维度划分为 block，对每个 block 做 mean pooling，再计算 block-level score 并选取 top-k K blocks。Triton kernel 只加载被选中的 K/V blocks 参与 attention。`topk_ratio=1.0` 时选择全部 blocks，可用于验证 dense 等价性。
-
-Sparse Int8 Attention 在 block-sparse attention 的基础上对 Q/K 做 per-block symmetric int8 量化。Q 的 scale 中合入 `1.44269504/sqrt(d)`，便于 kernel 内使用 `exp2`。K 默认使用 smooth-k，即量化前减去 token 维度上的 per-channel mean；该常数偏移不会改变 softmax 输出。V 保持 fp16，以降低量化误差。
+| CUDA | 13.0 |
+| GPU | CUDA-capable GPU |
 
 ## 2. 任务 1：T2I 生成结果
 
