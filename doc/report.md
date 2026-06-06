@@ -1,108 +1,64 @@
-# 实验 2：Attention 机制实现与 PixArt-Alpha 推理评估
+# CM2026 Project 2 实验报告
 
 日期：2026-06-06
 
-## 1. 实验目标
+## 1. 实验设置
 
-本实验实现并评估四类 Attention 后端：
+### 1.1 实验目标
 
-- `vanilla_attention`：纯 PyTorch 版本的 scaled dot-product attention。
-- `flash_attention_2`：基于 Triton 的 Flash Attention 2 forward kernel。
-- `sparse_attention`：基于 block selection 的 Triton block-sparse attention。
-- `sparse_int8_attention`：对 Q/K 做 per-block int8 量化的 Triton sparse attention。
+本实验围绕 PixArt-Alpha Text-to-Image 推理中的 self-attention 计算进行实现与优化。实验主要完成以下四类 attention 后端：
 
-实验分为两部分：第一部分将不同 attention 后端接入 PixArt-Alpha Text-to-Image 推理，比较图像质量与采样时间；第二部分使用 `benchmark_attention.py` 和 `test_sparse_int8.py` 系统评估速度与数值误差。
+- Vanilla Attention：使用 PyTorch 张量运算实现标准 scaled dot-product attention。
+- Triton Flash Attention 2：使用 Triton 实现 forward-only 的分块 dense attention。
+- Block-Sparse Attention：使用 PyTorch 做 block selection，并使用 Triton kernel 只计算被选中的 K/V blocks。
+- Sparse Int8 Attention：在 block-sparse attention 的基础上，对 Q/K 做 per-block int8 量化，V 保持 fp16。
 
-## 2. 实验环境
+实验包括两部分：任务 1 将不同 attention 后端接入 PixArt-Alpha，比较生成质量与采样时间；任务 2 使用独立 benchmark 脚本评估速度、CosSim、RelL1 和 RMSE。
+
+### 1.2 硬件与软件环境
 
 | 项目 | 配置 |
 |---|---|
 | 操作系统 | Windows |
-| 终端 / 环境 | PowerShell, Miniconda `na` |
+| 运行环境 | Miniconda `na` |
 | GPU | CUDA-capable GPU |
 | Python | 3.11.15 |
 | PyTorch | 2.12.0+cu130 |
 | Triton | 3.4.0 |
 | CUDA runtime | 13.0 |
-| T2I 模型 | PixArt-Alpha `PixArt-XL-2-1024-MS.pth` |
-| VAE | `sd-vae-ft-ema` |
-| T2I 设置 | image size 1024, DPM-Solver, 20 steps, batch size 1, fp16 |
-| Prompt 设置 | 使用 `data/prompt_embeddings/` 中 20 个预提取 T5 embeddings |
+| T2I 模型 | PixArt-Alpha |
+| 推理设置 | image size 1024, DPM-Solver, 20 steps, batch size 1, fp16 |
+| Prompt 设置 | 使用 20 个预提取 T5 embeddings |
 
-原始结果文件：
+### 1.3 实现概述
 
-- `doc/t2i_timing_summary.csv`
-- `doc/benchmark_results_full.txt`
-- `doc/benchmark_results_full.csv`
-- `doc/benchmark_key_summary.csv`
-- `doc/sparse_int8_results_full.txt`
+Vanilla Attention 直接计算 `QK^T / sqrt(d)`，再执行 softmax 和 `attn @ V`。该实现数值上与 SDPA 接近，但需要显式生成完整 attention matrix，因此显存访问和计算开销较高。
 
-## 3. 实现方法
+Triton Flash Attention 2 使用二维 grid，每个 program 负责一个 Q block。kernel 分块扫描 K/V blocks，并使用 online softmax 维护最大值、归一化因子和累积输出，从而避免显式保存完整的 `N x N` score 矩阵。实现中使用 `exp2`，并将 `1/ln(2)` 合入缩放系数；对于非 2 的幂的 head dimension 使用 mask 处理。
 
-### 3.1 Vanilla Attention
+Block-Sparse Attention 首先将 Q/K 沿序列维度划分为 block，对每个 block 做 mean pooling，再计算 block-level score 并选取 top-k K blocks。Triton kernel 只加载被选中的 K/V blocks 参与 attention。`topk_ratio=1.0` 时选择全部 blocks，可用于验证 dense 等价性。
 
-`attention/vanilla.py` 使用显式矩阵乘法实现：
+Sparse Int8 Attention 在 block-sparse attention 的基础上对 Q/K 做 per-block symmetric int8 量化。Q 的 scale 中合入 `1.44269504/sqrt(d)`，便于 kernel 内使用 `exp2`。K 默认使用 smooth-k，即量化前减去 token 维度上的 per-channel mean；该常数偏移不会改变 softmax 输出。V 保持 fp16，以降低量化误差。
 
-\[
-\mathrm{Attention}(Q,K,V)=\mathrm{softmax}(QK^T/\sqrt{d})V
-\]
+## 2. 任务 1：T2I 生成结果
 
-实现中将 `q`、`k`、`v` 转为 `float32` 做 score 与 softmax，再将输出转回 `v.dtype`。该实现不调用 `F.scaled_dot_product_attention`，保留了 `attn_mask`、`dropout_p`、`training` 接口兼容性。
+### 2.1 生成质量对比
 
-### 3.2 Triton Flash Attention 2
-
-`attention/fa2.py` 使用 Triton JIT 实现 forward-only Flash Attention 2。核心设计如下：
-
-- 使用二维 grid `(ceil(N / BLOCK_M), B * H)`。
-- 每个 program 处理一个 query block。
-- 按 K/V block 流式扫描，使用 online softmax 维护局部最大值 `m_i`、归一化因子 `l_i` 和累积输出 `acc`。
-- 使用 `exp2`，缩放系数中合入 `1 / ln(2)`。
-- `head_dim` 支持非 2 的幂，例如 PixArt 中常见的 `D=72`，通过 `BLOCK_D=next_power_of_2(D)` 和 mask 处理。
-
-### 3.3 Block-Sparse Attention
-
-`attention/sparse.py` 分为两步：
-
-1. Block selection：
-   - 将 Q/K 沿序列维划分为 block，默认 `block_size=64`。
-   - 对每个 block 做 mean pooling。
-   - 计算 block-level score。
-   - 对每个 Q block 选取 top-k K blocks，返回 `[B, H, num_q_blocks, topk]` 的 int32 indices。
-
-2. Triton sparse attention kernel：
-   - 结构类似 FA2 kernel。
-   - 每个 Q block 只访问被选中的 K/V blocks。
-   - `topk_ratio=1.0` 时选择全部 block，数值上退化为 dense attention。
-
-### 3.4 Sparse Int8 Attention
-
-`attention/sparse_int8.py` 复用 block selection，并增加 Q/K per-block int8 量化：
-
-- 每个 block 使用 symmetric int8 量化，`scale=max(abs(x))/127`。
-- Q 的 scale 合入 `1.44269504/sqrt(d)`，方便 attention kernel 中使用 `exp2`。
-- K 默认启用 `smooth_k`，即量化前减去 token 维度上的 per-channel mean；该偏移在 softmax 中会被抵消。
-- V 保持 fp16，避免量化 V 带来更明显的输出误差。
-- int8 attention kernel 中使用 `tl.dot(q_int8, k_int8)` 得到 int32 accum，再乘 `q_scale*k_scale` 反量化。
-
-## 4. 任务 1：T2I 生成评估
-
-### 4.1 生成效果对比
-
-下图展示 prompt 000 在主要后端上的生成结果。SDPA、Vanilla、Triton FA2、Sparse topk=1.0、Int8 topk=1.0 在主体结构和语义上非常接近；Sparse/Int8 在 topk=0.5 时仍能保持 prompt 语义，但构图和细节会出现更明显变化。
+下图展示同一 prompt 在主要 attention 后端下的生成结果。SDPA、Vanilla、Triton FA2、Sparse topk=1.0 和 Sparse Int8 topk=1.0 的主体结构和语义基本一致；当 topk 降到 0.5 时，图像仍能保持 prompt 语义，但构图和局部细节会出现更明显变化。
 
 ![T2I attention comparison](../pic/t2i_attention_prompt000.jpg)
 
-Sparse attention 的 topk 消融如下。topk 越小，速度越快，但局部细节和构图变化更明显；topk=0.8/0.9 与 topk=1.0 更接近，但速度收益降低。
+Sparse attention 的 topk 消融结果如下。topk 越低，参与 attention 的 K/V blocks 越少，速度越快，但图像细节和构图变化越明显。topk=0.8/0.9 与 topk=1.0 更接近，但速度收益较小。
 
 ![Sparse topk prompt 000](../pic/sparse_topk_prompt000.jpg)
 
 ![Sparse topk prompt 001](../pic/sparse_topk_prompt001.jpg)
 
-Sparse Int8 在 5 个 topk 设置下均成功生成图像，无 crash、NaN、全黑或全白输出。
+Sparse Int8 在 `topk_ratio ∈ {0.3, 0.5, 0.8, 0.9, 1.0}` 五组设置下均能正常生成图像，没有出现 crash、NaN、全黑或全白结果。
 
 ![Sparse int8 topk prompt 000](../pic/sparse_int8_topk_prompt000.jpg)
 
-### 4.2 T2I 采样时间
+### 2.2 平均采样时间
 
 | Attention | topk | 图片数 | 平均采样时间 s/image | 总采样时间 s |
 |---|---:|---:|---:|---:|
@@ -122,68 +78,153 @@ Sparse Int8 在 5 个 topk 设置下均成功生成图像，无 crash、NaN、�
 
 ![T2I backend timing](../pic/t2i_backend_timing_bar.png)
 
+主要结果如下：
+
+- Vanilla 平均 `54.203s/image`，约为 SDPA 耗时的 `2.65x`，速度最慢。
+- Triton FA2 平均 `22.001s/image`，约为 SDPA 耗时的 `1.08x`，满足“不超过 SDPA 2.5 倍”的要求。
+- Sparse topk=1.0 平均 `22.868s/image`，数值和生成效果接近 dense attention。
+- Sparse topk=0.5 平均 `17.792s/image`，相比 topk=1.0 快约 `22.2%`，满足 topk=0.5 至少加速 10% 的要求。
+- Sparse Int8 topk=0.5 平均 `17.237s/image`，略快于 fp16 sparse topk=0.5。
+
+### 2.3 topk 消融实验
+
 ![T2I topk timing curve](../pic/t2i_topk_timing_curve.png)
 
-主要观察：
+从速度曲线可以看出，topk 越大，平均采样时间越长。对于本次 T2I 推理，Sparse topk=0.5 在质量和速度之间取得了较好的折中：相比 topk=0.3，图像语义和构图更稳定；相比 topk=1.0，采样时间明显下降。Sparse Int8 的曲线整体略低于 fp16 sparse，但由于 PixArt 当前序列长度不算特别长，int8 的优势并没有像长序列 benchmark 中那样明显。
 
-- Vanilla 是最慢的，平均 `54.203s/image`，约为 SDPA 的 `2.65x` 耗时。
-- Triton FA2 平均 `22.001s/image`，约为 SDPA 的 `1.08x` 耗时，满足“不超过 SDPA 2.5 倍”的要求。
-- Sparse topk=1.0 平均 `22.868s/image`，约为 SDPA 的 `1.12x` 耗时，数值与生成效果接近 dense attention。
-- Sparse topk=0.5 平均 `17.792s/image`，相比 topk=1.0 的 `22.868s/image` 快约 `22.2%`，满足 topk=0.5 至少加速 10% 的要求。
-- Sparse Int8 topk=0.5 平均 `17.237s/image`，比 fp16 sparse topk=0.5 略快；在 PixArt 当前序列长度下，int8 的量化开销和 matmul 收益接近抵消。
+### 2.4 逐图采样时间
 
-## 5. 任务 2：Attention Benchmark
+下表汇总 20 张图在各 attention 后端下的采样时间，单位为秒。
 
-Benchmark 使用默认设置：
+| Image | SDPA | Vanilla | FA2 | Sparse0.3 | Sparse0.5 | Sparse0.8 | Sparse0.9 | Sparse1.0 | Int8-0.3 | Int8-0.5 | Int8-0.8 | Int8-0.9 | Int8-1.0 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 000 | 18.835 | 52.838 | 21.809 | 15.581 | 18.012 | 20.580 | 21.716 | 22.773 | 16.310 | 17.182 | 19.627 | 21.414 | 21.147 |
+| 001 | 18.457 | 53.729 | 21.689 | 14.817 | 17.150 | 19.402 | 21.261 | 22.644 | 14.722 | 16.989 | 18.907 | 20.476 | 20.697 |
+| 002 | 19.089 | 54.031 | 22.105 | 15.430 | 18.381 | 19.902 | 21.716 | 22.698 | 14.914 | 17.068 | 19.144 | 20.629 | 21.220 |
+| 003 | 19.874 | 53.859 | 22.266 | 15.519 | 17.936 | 19.959 | 21.935 | 22.506 | 15.053 | 17.675 | 19.716 | 21.058 | 21.401 |
+| 004 | 20.018 | 54.501 | 22.339 | 15.365 | 17.781 | 20.001 | 21.926 | 22.837 | 15.137 | 17.335 | 19.486 | 21.001 | 21.281 |
+| 005 | 20.273 | 54.315 | 22.328 | 15.583 | 17.886 | 20.320 | 22.148 | 23.202 | 15.274 | 17.313 | 19.702 | 20.981 | 21.313 |
+| 006 | 21.338 | 54.449 | 22.226 | 15.425 | 17.817 | 20.400 | 21.992 | 22.832 | 15.276 | 17.433 | 19.819 | 20.805 | 21.268 |
+| 007 | 21.553 | 53.826 | 22.215 | 15.535 | 18.019 | 20.376 | 22.119 | 22.666 | 15.399 | 17.207 | 19.672 | 20.630 | 21.515 |
+| 008 | 20.944 | 54.066 | 22.203 | 15.585 | 17.858 | 20.487 | 22.598 | 22.986 | 15.745 | 17.492 | 19.673 | 20.864 | 21.372 |
+| 009 | 20.599 | 54.394 | 22.153 | 15.332 | 17.843 | 20.763 | 22.277 | 22.529 | 15.851 | 17.662 | 19.805 | 20.943 | 21.618 |
+| 010 | 20.700 | 54.576 | 22.287 | 15.383 | 17.852 | 20.726 | 22.185 | 22.481 | 15.905 | 17.415 | 19.644 | 20.588 | 21.388 |
+| 011 | 20.618 | 55.027 | 22.200 | 15.216 | 17.761 | 20.764 | 22.347 | 22.700 | 15.811 | 17.403 | 19.687 | 20.881 | 21.256 |
+| 012 | 20.547 | 54.227 | 22.044 | 15.436 | 17.731 | 20.839 | 22.259 | 22.785 | 16.037 | 17.597 | 19.735 | 20.882 | 21.361 |
+| 013 | 20.625 | 53.721 | 21.907 | 15.668 | 17.666 | 20.722 | 22.393 | 23.357 | 15.826 | 17.231 | 19.850 | 20.913 | 21.478 |
+| 014 | 20.673 | 54.067 | 21.959 | 16.198 | 17.707 | 20.797 | 22.409 | 22.950 | 15.743 | 17.278 | 19.849 | 21.105 | 21.388 |
+| 015 | 20.650 | 54.442 | 21.681 | 16.096 | 18.114 | 20.817 | 22.237 | 23.236 | 15.692 | 16.944 | 19.712 | 20.877 | 21.331 |
+| 016 | 20.841 | 54.481 | 21.803 | 15.972 | 17.527 | 20.672 | 22.044 | 23.186 | 15.763 | 16.912 | 19.927 | 20.752 | 21.360 |
+| 017 | 20.927 | 54.691 | 21.575 | 15.897 | 17.494 | 20.694 | 22.089 | 23.075 | 15.663 | 16.957 | 20.172 | 20.854 | 21.208 |
+| 018 | 21.105 | 54.836 | 21.478 | 15.916 | 17.931 | 20.602 | 22.065 | 22.885 | 15.568 | 16.838 | 20.137 | 20.704 | 21.247 |
+| 019 | 20.721 | 53.988 | 21.756 | 15.831 | 17.370 | 20.801 | 22.125 | 23.031 | 15.943 | 16.811 | 20.113 | 20.759 | 21.330 |
 
-- Batch size: 2
-- dtype: fp16
-- `N ∈ {2048, 4096, 8192, 16384}`
-- `H ∈ {8, 16}`
-- `D ∈ {64, 128}`
-- sparse / sparse_int8 topk ratios: `{0.3, 0.5, 0.8, 0.9, 1.0}`
-- warmup 10, iterations 50
+## 3. 任务 2：Attention Benchmark 结果
 
-下表保留验收最关键的后端。单元格格式为：
+### 3.1 benchmark_attention.py 结果
 
-`time_ms / speedup_vs_SDPA / CosSim / RelL1`
+Benchmark 设置为 `B=2`、fp16、warmup 10、iterations 50，测试 `N ∈ {2048,4096,8192,16384}`、`H ∈ {8,16}`、`D ∈ {64,128}`。下表列出验收最关键的后端，Speedup 定义为 `time_SDPA / time_backend`。
 
-| H | N | D | SDPA ms | FA2 ms/speed/Cos/RelL1 | Sparse1.0 ms/speed/Cos/RelL1 | Sparse0.8 ms/speed/Cos/RelL1 | Int8-1.0 ms/speed/Cos/RelL1 | Int8-0.8 ms/speed/Cos/RelL1 |
-|---:|---:|---:|---:|---|---|---|---|---|
-| 8 | 2048 | 64 | 1.019 | 0.878/1.16x/1.000/1.22e-07 | 0.908/1.12x/1.000/1.22e-07 | 0.790/1.29x/0.906/4.66e-01 | 0.643/1.59x/1.000/1.22e-02 | 0.629/1.62x/0.906/4.66e-01 |
-| 8 | 4096 | 64 | 3.672 | 3.090/1.19x/1.000/1.73e-07 | 3.269/1.12x/1.000/1.73e-07 | 2.608/1.41x/0.904/4.74e-01 | 2.468/1.49x/1.000/1.25e-02 | 2.049/1.79x/0.904/4.74e-01 |
-| 8 | 8192 | 64 | 16.430 | 12.612/1.30x/1.000/2.35e-07 | 13.813/1.19x/1.000/2.35e-07 | 11.006/1.49x/0.901/4.82e-01 | 8.714/1.89x/1.000/1.23e-02 | 7.575/2.17x/0.901/4.82e-01 |
-| 8 | 16384 | 64 | 65.579 | 52.798/1.24x/1.000/3.24e-07 | 54.093/1.21x/1.000/3.24e-07 | 44.831/1.46x/0.900/4.88e-01 | 36.930/1.78x/1.000/1.23e-02 | 30.968/2.12x/0.899/4.88e-01 |
-| 16 | 2048 | 64 | 2.103 | 1.732/1.21x/1.000/1.16e-07 | 1.793/1.17x/1.000/1.16e-07 | 1.462/1.44x/0.905/4.69e-01 | 1.352/1.56x/1.000/1.23e-02 | 1.177/1.79x/0.905/4.69e-01 |
-| 16 | 4096 | 64 | 8.527 | 6.582/1.30x/1.000/1.74e-07 | 6.934/1.23x/1.000/1.74e-07 | 5.737/1.49x/0.905/4.71e-01 | 4.879/1.75x/1.000/1.23e-02 | 4.364/1.95x/0.905/4.71e-01 |
-| 16 | 8192 | 64 | 33.669 | 26.974/1.25x/1.000/2.27e-07 | 27.566/1.22x/1.000/2.27e-07 | 22.492/1.50x/0.902/4.81e-01 | 19.128/1.76x/1.000/1.23e-02 | 15.857/2.12x/0.901/4.82e-01 |
-| 16 | 16384 | 64 | 131.887 | 104.949/1.26x/1.000/3.20e-07 | 107.601/1.23x/1.000/3.20e-07 | 88.602/1.49x/0.901/4.83e-01 | 74.374/1.77x/1.000/1.22e-02 | 61.788/2.13x/0.901/4.83e-01 |
-| 8 | 2048 | 128 | 2.401 | 1.908/1.26x/1.000/5.22e-05 | 1.943/1.24x/1.000/5.22e-05 | 2.001/1.20x/0.906/4.69e-01 | 1.849/1.30x/1.000/1.28e-02 | 2.624/0.91x/0.905/4.69e-01 |
-| 8 | 4096 | 128 | 8.756 | 8.307/1.05x/1.000/4.25e-05 | 8.622/1.02x/1.000/4.25e-05 | 7.051/1.24x/0.905/4.70e-01 | 7.335/1.19x/1.000/1.29e-02 | 6.022/1.45x/0.905/4.71e-01 |
-| 8 | 8192 | 128 | 34.516 | 35.417/0.97x/1.000/3.37e-05 | 36.192/0.95x/1.000/3.37e-05 | 29.142/1.18x/0.902/4.79e-01 | 30.620/1.13x/1.000/1.27e-02 | 25.194/1.37x/0.902/4.79e-01 |
-| 8 | 16384 | 128 | 138.473 | 143.640/0.96x/1.000/2.70e-05 | 145.003/0.95x/1.000/2.70e-05 | 117.034/1.18x/0.900/4.86e-01 | 120.660/1.15x/1.000/1.28e-02 | 96.886/1.43x/0.900/4.86e-01 |
-| 16 | 2048 | 128 | 4.476 | 4.563/0.98x/1.000/5.21e-05 | 4.578/0.98x/1.000/5.21e-05 | 3.913/1.14x/0.905/4.69e-01 | 4.293/1.04x/1.000/1.28e-02 | 3.785/1.18x/0.905/4.70e-01 |
-| 16 | 4096 | 128 | 17.619 | 17.885/0.99x/1.000/4.20e-05 | 18.114/0.97x/1.000/4.20e-05 | 15.364/1.15x/0.906/4.68e-01 | 15.947/1.10x/1.000/1.27e-02 | 13.384/1.32x/0.905/4.69e-01 |
-| 16 | 8192 | 128 | 69.587 | 70.526/0.99x/1.000/3.39e-05 | 71.799/0.97x/1.000/3.39e-05 | 58.524/1.19x/0.902/4.80e-01 | 60.330/1.15x/1.000/1.28e-02 | 50.378/1.38x/0.902/4.80e-01 |
-| 16 | 16384 | 128 | 277.092 | 279.068/0.99x/1.000/2.70e-05 | 291.577/0.95x/1.000/2.70e-05 | 229.690/1.21x/0.900/4.86e-01 | 245.049/1.13x/1.000/1.28e-02 | 191.269/1.45x/0.900/4.86e-01 |
+| H | N | D | Backend | Time ms | Speedup | CosSim | RelL1 | RMSE |
+|---:|---:|---:|---|---:|---:|---:|---:|---:|
+| 8 | 2048 | 64 | triton_fa2 | 0.878 | 1.16x | 1.000000 | 1.22e-07 | 3.40e-07 |
+| 8 | 2048 | 64 | sparse(topk=1.0) | 0.908 | 1.12x | 1.000000 | 1.22e-07 | 3.40e-07 |
+| 8 | 2048 | 64 | sparse(topk=0.8) | 0.790 | 1.29x | 0.906143 | 4.66e-01 | 1.72e-02 |
+| 8 | 2048 | 64 | sparse_int8(topk=1.0) | 0.643 | 1.59x | 0.999924 | 1.22e-02 | 4.53e-04 |
+| 8 | 2048 | 64 | sparse_int8(topk=0.8) | 0.629 | 1.62x | 0.906069 | 4.66e-01 | 1.72e-02 |
+| 8 | 4096 | 64 | triton_fa2 | 3.090 | 1.19x | 1.000000 | 1.73e-07 | 2.88e-07 |
+| 8 | 4096 | 64 | sparse(topk=1.0) | 3.269 | 1.12x | 1.000000 | 1.73e-07 | 2.88e-07 |
+| 8 | 4096 | 64 | sparse(topk=0.8) | 2.608 | 1.41x | 0.903882 | 4.74e-01 | 1.22e-02 |
+| 8 | 4096 | 64 | sparse_int8(topk=1.0) | 2.468 | 1.49x | 0.999921 | 1.25e-02 | 3.22e-04 |
+| 8 | 4096 | 64 | sparse_int8(topk=0.8) | 2.049 | 1.79x | 0.903810 | 4.74e-01 | 1.22e-02 |
+| 8 | 8192 | 64 | triton_fa2 | 12.612 | 1.30x | 1.000000 | 2.35e-07 | 2.37e-07 |
+| 8 | 8192 | 64 | sparse(topk=1.0) | 13.813 | 1.19x | 1.000000 | 2.35e-07 | 2.37e-07 |
+| 8 | 8192 | 64 | sparse(topk=0.8) | 11.006 | 1.49x | 0.901425 | 4.82e-01 | 8.84e-03 |
+| 8 | 8192 | 64 | sparse_int8(topk=1.0) | 8.714 | 1.89x | 0.999923 | 1.23e-02 | 2.28e-04 |
+| 8 | 8192 | 64 | sparse_int8(topk=0.8) | 7.575 | 2.17x | 0.901359 | 4.82e-01 | 8.84e-03 |
+| 8 | 16384 | 64 | triton_fa2 | 52.798 | 1.24x | 1.000000 | 3.24e-07 | 1.96e-07 |
+| 8 | 16384 | 64 | sparse(topk=1.0) | 54.093 | 1.21x | 1.000000 | 3.24e-07 | 1.96e-07 |
+| 8 | 16384 | 64 | sparse(topk=0.8) | 44.831 | 1.46x | 0.899504 | 4.88e-01 | 6.33e-03 |
+| 8 | 16384 | 64 | sparse_int8(topk=1.0) | 36.930 | 1.78x | 0.999923 | 1.23e-02 | 1.61e-04 |
+| 8 | 16384 | 64 | sparse_int8(topk=0.8) | 30.968 | 2.12x | 0.899439 | 4.88e-01 | 6.33e-03 |
+| 16 | 2048 | 64 | triton_fa2 | 1.732 | 1.21x | 1.000000 | 1.16e-07 | 3.36e-07 |
+| 16 | 2048 | 64 | sparse(topk=1.0) | 1.793 | 1.17x | 1.000000 | 1.16e-07 | 3.36e-07 |
+| 16 | 2048 | 64 | sparse(topk=0.8) | 1.462 | 1.44x | 0.905062 | 4.69e-01 | 1.73e-02 |
+| 16 | 2048 | 64 | sparse_int8(topk=1.0) | 1.352 | 1.56x | 0.999923 | 1.23e-02 | 4.54e-04 |
+| 16 | 2048 | 64 | sparse_int8(topk=0.8) | 1.177 | 1.79x | 0.904990 | 4.69e-01 | 1.73e-02 |
+| 16 | 4096 | 64 | triton_fa2 | 6.582 | 1.30x | 1.000000 | 1.74e-07 | 2.90e-07 |
+| 16 | 4096 | 64 | sparse(topk=1.0) | 6.934 | 1.23x | 1.000000 | 1.74e-07 | 2.90e-07 |
+| 16 | 4096 | 64 | sparse(topk=0.8) | 5.737 | 1.49x | 0.904809 | 4.71e-01 | 1.22e-02 |
+| 16 | 4096 | 64 | sparse_int8(topk=1.0) | 4.879 | 1.75x | 0.999922 | 1.23e-02 | 3.21e-04 |
+| 16 | 4096 | 64 | sparse_int8(topk=0.8) | 4.364 | 1.95x | 0.904740 | 4.71e-01 | 1.22e-02 |
+| 16 | 8192 | 64 | triton_fa2 | 26.974 | 1.25x | 1.000000 | 2.27e-07 | 2.33e-07 |
+| 16 | 8192 | 64 | sparse(topk=1.0) | 27.566 | 1.22x | 1.000000 | 2.27e-07 | 2.33e-07 |
+| 16 | 8192 | 64 | sparse(topk=0.8) | 22.492 | 1.50x | 0.901554 | 4.81e-01 | 8.85e-03 |
+| 16 | 8192 | 64 | sparse_int8(topk=1.0) | 19.128 | 1.76x | 0.999923 | 1.23e-02 | 2.27e-04 |
+| 16 | 8192 | 64 | sparse_int8(topk=0.8) | 15.857 | 2.12x | 0.901482 | 4.82e-01 | 8.85e-03 |
+| 16 | 16384 | 64 | triton_fa2 | 104.949 | 1.26x | 1.000000 | 3.20e-07 | 1.96e-07 |
+| 16 | 16384 | 64 | sparse(topk=1.0) | 107.601 | 1.23x | 1.000000 | 3.20e-07 | 1.96e-07 |
+| 16 | 16384 | 64 | sparse(topk=0.8) | 88.602 | 1.49x | 0.901075 | 4.83e-01 | 6.33e-03 |
+| 16 | 16384 | 64 | sparse_int8(topk=1.0) | 74.374 | 1.77x | 0.999924 | 1.22e-02 | 1.61e-04 |
+| 16 | 16384 | 64 | sparse_int8(topk=0.8) | 61.788 | 2.13x | 0.901004 | 4.83e-01 | 6.33e-03 |
+| 8 | 2048 | 128 | triton_fa2 | 1.908 | 1.26x | 1.000000 | 5.22e-05 | 5.60e-06 |
+| 8 | 2048 | 128 | sparse(topk=1.0) | 1.943 | 1.24x | 1.000000 | 5.22e-05 | 5.60e-06 |
+| 8 | 2048 | 128 | sparse(topk=0.8) | 2.001 | 1.20x | 0.905522 | 4.69e-01 | 1.72e-02 |
+| 8 | 2048 | 128 | sparse_int8(topk=1.0) | 1.849 | 1.30x | 0.999917 | 1.28e-02 | 4.69e-04 |
+| 8 | 2048 | 128 | sparse_int8(topk=0.8) | 2.624 | 0.91x | 0.905450 | 4.69e-01 | 1.72e-02 |
+| 8 | 4096 | 128 | triton_fa2 | 8.307 | 1.05x | 1.000000 | 4.25e-05 | 3.56e-06 |
+| 8 | 4096 | 128 | sparse(topk=1.0) | 8.622 | 1.02x | 1.000000 | 4.25e-05 | 3.56e-06 |
+| 8 | 4096 | 128 | sparse(topk=0.8) | 7.051 | 1.24x | 0.904990 | 4.70e-01 | 1.21e-02 |
+| 8 | 4096 | 128 | sparse_int8(topk=1.0) | 7.335 | 1.19x | 0.999916 | 1.29e-02 | 3.33e-04 |
+| 8 | 4096 | 128 | sparse_int8(topk=0.8) | 6.022 | 1.45x | 0.904914 | 4.71e-01 | 1.22e-02 |
+| 8 | 8192 | 128 | triton_fa2 | 35.417 | 0.97x | 1.000000 | 3.37e-05 | 2.26e-06 |
+| 8 | 8192 | 128 | sparse(topk=1.0) | 36.192 | 0.95x | 1.000000 | 3.37e-05 | 2.26e-06 |
+| 8 | 8192 | 128 | sparse(topk=0.8) | 29.142 | 1.18x | 0.902139 | 4.79e-01 | 8.82e-03 |
+| 8 | 8192 | 128 | sparse_int8(topk=1.0) | 30.620 | 1.13x | 0.999918 | 1.27e-02 | 2.35e-04 |
+| 8 | 8192 | 128 | sparse_int8(topk=0.8) | 25.194 | 1.37x | 0.902064 | 4.79e-01 | 8.83e-03 |
+| 8 | 16384 | 128 | triton_fa2 | 143.640 | 0.96x | 1.000000 | 2.70e-05 | 1.43e-06 |
+| 8 | 16384 | 128 | sparse(topk=1.0) | 145.003 | 0.95x | 1.000000 | 2.70e-05 | 1.43e-06 |
+| 8 | 16384 | 128 | sparse(topk=0.8) | 117.034 | 1.18x | 0.899964 | 4.86e-01 | 6.30e-03 |
+| 8 | 16384 | 128 | sparse_int8(topk=1.0) | 120.660 | 1.15x | 0.999917 | 1.28e-02 | 1.66e-04 |
+| 8 | 16384 | 128 | sparse_int8(topk=0.8) | 96.886 | 1.43x | 0.899891 | 4.86e-01 | 6.30e-03 |
+| 16 | 2048 | 128 | triton_fa2 | 4.563 | 0.98x | 1.000000 | 5.21e-05 | 5.58e-06 |
+| 16 | 2048 | 128 | sparse(topk=1.0) | 4.578 | 0.98x | 1.000000 | 5.21e-05 | 5.58e-06 |
+| 16 | 2048 | 128 | sparse(topk=0.8) | 3.913 | 1.14x | 0.904845 | 4.69e-01 | 1.72e-02 |
+| 16 | 2048 | 128 | sparse_int8(topk=1.0) | 4.293 | 1.04x | 0.999917 | 1.28e-02 | 4.70e-04 |
+| 16 | 2048 | 128 | sparse_int8(topk=0.8) | 3.785 | 1.18x | 0.904769 | 4.70e-01 | 1.72e-02 |
+| 16 | 4096 | 128 | triton_fa2 | 17.885 | 0.99x | 1.000000 | 4.20e-05 | 3.56e-06 |
+| 16 | 4096 | 128 | sparse(topk=1.0) | 18.114 | 0.97x | 1.000000 | 4.20e-05 | 3.56e-06 |
+| 16 | 4096 | 128 | sparse(topk=0.8) | 15.364 | 1.15x | 0.905560 | 4.68e-01 | 1.22e-02 |
+| 16 | 4096 | 128 | sparse_int8(topk=1.0) | 15.947 | 1.10x | 0.999918 | 1.27e-02 | 3.32e-04 |
+| 16 | 4096 | 128 | sparse_int8(topk=0.8) | 13.384 | 1.32x | 0.905486 | 4.69e-01 | 1.22e-02 |
+| 16 | 8192 | 128 | triton_fa2 | 70.526 | 0.99x | 1.000000 | 3.39e-05 | 2.26e-06 |
+| 16 | 8192 | 128 | sparse(topk=1.0) | 71.799 | 0.97x | 1.000000 | 3.39e-05 | 2.26e-06 |
+| 16 | 8192 | 128 | sparse(topk=0.8) | 58.524 | 1.19x | 0.901938 | 4.80e-01 | 8.80e-03 |
+| 16 | 8192 | 128 | sparse_int8(topk=1.0) | 60.330 | 1.15x | 0.999918 | 1.28e-02 | 2.35e-04 |
+| 16 | 8192 | 128 | sparse_int8(topk=0.8) | 50.378 | 1.38x | 0.901864 | 4.80e-01 | 8.81e-03 |
+| 16 | 16384 | 128 | triton_fa2 | 279.068 | 0.99x | 1.000000 | 2.70e-05 | 1.43e-06 |
+| 16 | 16384 | 128 | sparse(topk=1.0) | 291.577 | 0.95x | 1.000000 | 2.70e-05 | 1.43e-06 |
+| 16 | 16384 | 128 | sparse(topk=0.8) | 229.690 | 1.21x | 0.900387 | 4.86e-01 | 6.31e-03 |
+| 16 | 16384 | 128 | sparse_int8(topk=1.0) | 245.049 | 1.13x | 0.999918 | 1.28e-02 | 1.66e-04 |
+| 16 | 16384 | 128 | sparse_int8(topk=0.8) | 191.269 | 1.45x | 0.900314 | 4.86e-01 | 6.31e-03 |
 
-![Benchmark speedup H16 D64](../pic/benchmark_speedup_h16_d64.png)
+![Benchmark speedup](../pic/benchmark_speedup_h16_d64.png)
 
-### 5.1 达标情况
+### 3.2 达标情况
 
-| 后端 | 关键指标 | 结果 |
-|---|---|---|
-| Triton FA2 | speedup ≥ 0.4, CosSim > 0.99, RelL1 < 1e-3 | 16 个配置全部满足；最小 speedup `0.964x`，最大 RelL1 `5.22e-05` |
-| Sparse topk=1.0 | speedup ≥ 0.4, CosSim > 0.99, RelL1 < 1e-3 | 16 个配置全部满足；最小 speedup `0.950x` |
-| Sparse topk=0.8 | CosSim > 0.8, RelL1 < 1.0 | 16 个配置全部满足；最小 CosSim `0.8995`，最大 RelL1 `0.488` |
-| Sparse Int8 topk=1.0 | speedup ≥ 0.4, CosSim > 0.99, RelL1 < 2e-2 | 16 个配置全部满足；最小 CosSim `0.999916`，最大 RelL1 `0.01286` |
-| Sparse Int8 topk=0.8 | CosSim > 0.8, RelL1 < 1.0 | 16 个配置全部满足；最小 CosSim `0.899439`，最大 RelL1 `0.488` |
+| 后端 | 结果 |
+|---|---|
+| Triton FA2 | 16 个配置全部满足速度与精度要求；最小 speedup 为 `0.964x`，最大 RelL1 为 `5.22e-05`。 |
+| Sparse topk=1.0 | 16 个配置全部满足 dense 等价验证；最小 speedup 为 `0.950x`。 |
+| Sparse topk=0.8 | 16 个配置全部满足精度要求；最小 CosSim 为 `0.8995`，最大 RelL1 为 `0.488`。 |
+| Sparse Int8 topk=1.0 | 16 个配置全部满足 int8 精度要求；最小 CosSim 为 `0.999916`，最大 RelL1 为 `0.01286`。 |
+| Sparse Int8 topk=0.8 | 16 个配置全部满足稀疏 int8 精度要求；最小 CosSim 为 `0.899439`，最大 RelL1 为 `0.488`。 |
 
-注：在少数短序列配置中，`topk=0.8` 相比 `topk=1.0` 的 kernel 计时会受到固定开销和测量抖动影响，不一定严格更快。例如 `H=8,N=2048,D=128` 的 sparse / sparse_int8 结果中，`topk=0.8` 没有明显快于 `topk=1.0`。但在 T2I 主实验与 `N>=4096` 的 benchmark 中，稀疏度降低带来的速度收益是稳定的。
+少数短序列配置中，`topk=0.8` 相比 `topk=1.0` 的 kernel 计时没有严格更快，主要原因是 block selection、量化和 kernel launch 等固定开销占比较高。在 `N>=4096` 以及 T2I 主实验中，降低 topk 带来的速度收益更稳定。
 
-## 6. Sparse Int8 长序列测试
+### 3.3 test_sparse_int8.py 长序列加速
 
-默认配置：`B=2,H=16,D=64,topk=0.8,dtype=fp16,warmup=10,iters=30`。
+测试配置为 `B=2,H=16,D=64,topk=0.8,dtype=fp16,warmup=10,iters=30`。
 
 | N | Sparse fp16 ms | Sparse Int8 ms | Speedup | CosSim | RelL1 | RMSE |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -196,44 +237,34 @@ Benchmark 使用默认设置：
 
 ![Sparse int8 long sequence speedup](../pic/sparse_int8_long_seq_speedup.png)
 
-实验中 `N=16384` 时 speedup 为 `1.43x`，满足作业要求的 `>=1.20x`。本机上 int8 从 `N=1024` 起已经略快于 fp16 sparse，但 `N=2048` 之后优势更稳定，长序列下 speedup 维持在 `1.35x` 到 `1.48x`。
+`N=16384` 时 speedup 为 `1.43x`，满足作业要求的 `>=1.20x`。随着序列长度继续增加，int8 的 speedup 提升到 `1.48x`。
 
-## 7. 结果分析
+## 4. 结果分析
 
-### 7.1 为什么 Flash Attention 2 比 Vanilla 更快
+### 4.1 Flash Attention 2 为什么比 Vanilla Attention 更快
 
-Vanilla attention 显式构造完整的 `N x N` score 矩阵，再做 softmax 和矩阵乘法。这会带来较高的显存占用和大量 HBM 读写。Flash Attention 2 使用 tiling 和 online softmax，只在 SRAM 中保留当前 Q/K/V block 和累积状态，避免 materialize 完整 attention matrix。这样既减少访存，也提升 kernel 内计算密度，所以在 benchmark 中 FA2 相比 SDPA 也能达到接近或略快的速度；在 T2I 推理中，FA2 平均 `22.001s/image`，与 SDPA 的 `20.419s/image` 接近。
+Vanilla Attention 会显式构造完整的 `N x N` attention score 矩阵，然后再进行 softmax 和矩阵乘法。这种方式会产生大量 HBM 读写，并且中间矩阵占用显存较多。Flash Attention 2 采用分块计算和 online softmax，只在片上 SRAM 中保留当前 block 和累积统计量，不需要保存完整 attention matrix。因此它减少了显存访问次数，提高了计算和访存效率。
 
-### 7.2 Block-Sparse 的速度与质量平衡
+本实验中，Vanilla 的 T2I 平均采样时间为 `54.203s/image`，Triton FA2 为 `22.001s/image`。两者生成质量接近，但 FA2 的速度明显更好。
 
-Sparse attention 的速度收益来自减少参与 attention 的 K/V blocks。topk 越低，kernel 扫描的 K/V block 越少，因此速度越快。但这会丢失部分全局上下文，导致生成图像的构图、局部纹理和主体位置发生变化。
+### 4.2 Block-Sparse 的速度-质量平衡点
 
-从 T2I 结果看：
+Block-Sparse 的速度收益来自减少参与计算的 K/V blocks。topk 越低，计算量越小，但图像质量也越容易受到影响。根据 T2I 结果：
 
 - `topk=0.3` 最快，平均 `15.589s/image`，但图像构图变化较明显。
-- `topk=0.5` 平均 `17.792s/image`，相比 `topk=1.0` 快约 `22.2%`，仍能保持 prompt 语义，是较好的速度-质量折中。
+- `topk=0.5` 平均 `17.792s/image`，相比 `topk=1.0` 快约 `22.2%`，同时仍能保持 prompt 的主体语义。
 - `topk=0.8/0.9` 质量更接近 dense attention，但速度收益明显下降。
-- `topk=1.0` 用于验证 dense 等价性，数值和生成效果接近 SDPA，但由于 block selection 和 index 访问开销，T2I 中比 SDPA 稍慢。
 
-### 7.3 Int8 短序列慢、长序列快的原因
+综合生成效果和速度，本实验认为 `topk=0.5` 是 PixArt-Alpha T2I 场景下较合适的折中点。
 
-Int8 sparse attention 的耗时由三部分组成：
+### 4.3 Int8 量化短序列慢、长序列快的原因
 
-- Q/K per-block 量化开销。
-- block selection 开销。
-- int8 attention matmul 和 V 加权求和开销。
+Sparse Int8 的耗时包括三部分：Q/K 量化、block selection、int8 attention kernel。短序列时 attention 计算量较小，量化和 selection 的固定开销占比较高，因此 int8 不一定明显快于 fp16 sparse。PixArt-Alpha 当前 T2I 推理的序列长度不算特别长，所以 int8 在 T2I 中只表现为小幅加速。
 
-短序列时，attention 计算量较小，量化和 selection 的固定成本占比高，因此 int8 不一定显著快于 fp16 sparse。PixArt 的 T2I 序列长度相对不大，所以 sparse_int8 与 fp16 sparse 的差距不大。
+长序列时，attention matmul 成为主要开销，int8 tensor core 吞吐和较低访存带宽需求开始发挥作用。因此在长序列测试中，Sparse Int8 从 `N=2048` 开始表现出较稳定的加速，在 `N=16384` 达到 `1.43x`，在 `N=32768` 达到 `1.48x`。
 
-长序列时，attention matmul 成为主导成本，int8 tensor core 吞吐与更低访存带宽需求开始体现优势。`test_sparse_int8.py` 中，`N=16384` 时 int8 达到 `1.43x`，`N=32768` 达到 `1.48x`。因此本机实验中 int8 加速拐点约在 `N=1024-2048`，长序列收益更稳定。
+## 5. 总结
 
-## 8. 总结
+本实验实现并测试了四类 attention 后端。Vanilla Attention 适合作为正确性参考，但速度较慢；Triton Flash Attention 2 在保持 dense attention 精度的同时显著减少访存开销，整体速度接近或优于 SDPA；Block-Sparse Attention 可以通过降低 topk 减少计算量，在 `topk=0.5` 时取得较好的速度-质量平衡；Sparse Int8 在 PixArt-Alpha 的短序列 T2I 推理中收益有限，但在长序列 benchmark 中加速明显。
 
-本实验完成了四种 attention 后端的实现，并在 PixArt-Alpha 与独立 benchmark 上进行了评估：
-
-- Vanilla 实现正确但速度最慢，适合作为纯 PyTorch 正确性参考。
-- Triton FA2 与 SDPA 数值非常接近，速度满足验收要求。
-- Sparse attention 在降低 topk 后能明显加速，`topk=0.5` 在本次 T2I 中是较好的速度-质量折中点。
-- Sparse Int8 在 PixArt 短序列上收益有限，但在长序列 benchmark 中加速明显，`N>=16384` 满足 1.2x 以上要求。
-
-总体上，Flash Attention 主要优化 dense attention 的访存模式；Sparse attention 通过减少参与计算的 block 提供近似加速；Int8 attention 则更适合长序列、高计算量场景。
+整体来看，attention 优化可以从三个方向入手：一是通过 Flash Attention 改善 dense attention 的访存模式；二是通过 sparse selection 减少参与计算的 token blocks；三是通过 int8 量化提升长序列场景下的矩阵乘吞吐。不同方法的适用场景不同，需要结合序列长度、精度要求和固定开销综合选择。
