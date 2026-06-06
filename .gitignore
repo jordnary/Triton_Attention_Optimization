@@ -7,4 +7,6 @@ __pycache__/
 
 output/
 pretrained_models/
+doc/
+pic/
 benchmark_results.*
