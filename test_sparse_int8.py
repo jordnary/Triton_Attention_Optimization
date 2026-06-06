@@ -141,7 +141,7 @@ def main():
             cos_sim, rel_l1, rmse = compute_metrics(out_int8, ref)
 
         speedup = t_fp16 / t_int8
-        symbol = '✓' if speedup > 1.0 else '✗'
+        symbol = 'OK' if speedup > 1.0 else 'NO'
 
         line = (f'{N:6d} | {t_fp16:10.3f} ms | {t_int8:10.3f} ms | {speedup:7.2f}x {symbol} | '
                 f'{cos_sim:10.6f} | {rel_l1:8.2e} | {rmse:8.2e}')
