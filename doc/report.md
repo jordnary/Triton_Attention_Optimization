@@ -23,25 +23,25 @@
 
 图 2-1 展示同一 prompt 在主要 attention 后端下的生成结果。SDPA、Vanilla、Triton FA2、Sparse topk=1.0 和 Sparse Int8 topk=1.0 的主体结构和语义基本一致；当 topk 降到 0.5 时，图像仍能保持 prompt 语义，但构图和局部细节会出现更明显变化。
 
-**图 2-1 T2I attention comparison**：同一 prompt 在 SDPA、Vanilla、Triton FA2、Sparse 和 Sparse Int8 后端下的生成质量对比。
-
 ![T2I attention comparison](../pic/t2i_attention_prompt000.jpg)
+
+**图 2-1 T2I attention comparison**：同一 prompt 在 SDPA、Vanilla、Triton FA2、Sparse 和 Sparse Int8 后端下的生成质量对比。
 
 Sparse attention 的 topk 消融结果见图 2-2 和图 2-3。topk 越低，参与 attention 的 K/V blocks 越少，速度越快，但图像细节和构图变化越明显。topk=0.8/0.9 与 topk=1.0 更接近，但速度收益较小。
 
-**图 2-2 Sparse topk prompt 000**：`A majestic lion standing on a rocky cliff at sunset...` 在不同 `topk_ratio` 下的生成结果。
-
 ![Sparse topk prompt 000](../pic/sparse_topk_prompt000.jpg)
 
-**图 2-3 Sparse topk prompt 001**：`A cozy cottage in a snowy forest...` 在不同 `topk_ratio` 下的生成结果。
+**图 2-2 Sparse topk prompt 000**：`A majestic lion standing on a rocky cliff at sunset...` 在不同 `topk_ratio` 下的生成结果。
 
 ![Sparse topk prompt 001](../pic/sparse_topk_prompt001.jpg)
 
+**图 2-3 Sparse topk prompt 001**：`A cozy cottage in a snowy forest...` 在不同 `topk_ratio` 下的生成结果。
+
 Sparse Int8 的 topk 对比结果见图 2-4。在 `topk_ratio ∈ {0.3, 0.5, 0.8, 0.9, 1.0}` 五组设置下均能正常生成图像，没有出现 crash、NaN、全黑或全白结果。
 
-**图 2-4 Sparse Int8 topk prompt 000**：Sparse Int8 在 `prompt 000` 上不同 `topk_ratio` 的生成结果。
-
 ![Sparse int8 topk prompt 000](../pic/sparse_int8_topk_prompt000.jpg)
+
+**图 2-4 Sparse Int8 topk prompt 000**：Sparse Int8 在 `prompt 000` 上不同 `topk_ratio` 的生成结果。
 
 ### 2.2 平均采样时间
 
@@ -61,9 +61,9 @@ Sparse Int8 的 topk 对比结果见图 2-4。在 `topk_ratio ∈ {0.3, 0.5, 0.8
 | Sparse Int8 | 0.9 | 20 | 20.856 | 417.119 |
 | Sparse Int8 | 1.0 | 20 | 21.309 | 426.179 |
 
-**图 2-5 T2I backend timing**：不同 attention 后端在 T2I 推理中的平均采样时间对比。
-
 ![T2I backend timing](../pic/t2i_backend_timing_bar.png)
+
+**图 2-5 T2I backend timing**：不同 attention 后端在 T2I 推理中的平均采样时间对比。
 
 主要结果如下：
 
@@ -75,9 +75,9 @@ Sparse Int8 的 topk 对比结果见图 2-4。在 `topk_ratio ∈ {0.3, 0.5, 0.8
 
 ### 2.3 topk 消融实验
 
-**图 2-6 T2I topk timing curve**：Sparse 与 Sparse Int8 在不同 `topk_ratio` 下的平均采样时间曲线。
-
 ![T2I topk timing curve](../pic/t2i_topk_timing_curve.png)
+
+**图 2-6 T2I topk timing curve**：Sparse 与 Sparse Int8 在不同 `topk_ratio` 下的平均采样时间曲线。
 
 从速度曲线可以看出，topk 越大，平均采样时间越长。对于本次 T2I 推理，Sparse topk=0.5 在质量和速度之间取得了较好的折中：相比 topk=0.3，图像语义和构图更稳定；相比 topk=1.0，采样时间明显下降。Sparse Int8 的曲线整体略低于 fp16 sparse，但由于 PixArt 当前序列长度不算特别长，int8 的优势并没有像长序列 benchmark 中那样明显。
 
@@ -318,9 +318,9 @@ Benchmark 设置为 `B=2`、fp16、warmup 10、iterations 50，测试 `N ∈ {20
 | 16 | 16384 | 128 | sparse_int8(topk=0.9) | 218.541 | 1.27x | 0.953030 | 3.18e-01 | 4.14e-03 |
 | 16 | 16384 | 128 | sparse_int8(topk=1.0) | 245.049 | 1.13x | 0.999918 | 1.28e-02 | 1.66e-04 |
 
-**图 3-1 Benchmark speedup**：`H=16,D=64` 配置下各 attention 后端相对 SDPA 的 speedup 对比。
-
 ![Benchmark speedup](../pic/benchmark_speedup_h16_d64.png)
+
+**图 3-1 Benchmark speedup**：`H=16,D=64` 配置下各 attention 后端相对 SDPA 的 speedup 对比。
 
 
 ### 3.2 达标情况
@@ -352,9 +352,9 @@ Benchmark 设置为 `B=2`、fp16、warmup 10、iterations 50，测试 `N ∈ {20
 | 16384 | 85.740 | 60.166 | 1.43x | 0.901004 | 4.83e-01 | 6.33e-03 |
 | 32768 | 350.490 | 237.585 | 1.48x | 0.901479 | 4.82e-01 | 4.48e-03 |
 
-**图 3-2 Sparse Int8 long sequence speedup**：长序列设置下 Sparse Int8 相对 fp16 Sparse 的加速效果。
-
 ![Sparse int8 long sequence speedup](../pic/sparse_int8_long_seq_speedup.png)
+
+**图 3-2 Sparse Int8 long sequence speedup**：长序列设置下 Sparse Int8 相对 fp16 Sparse 的加速效果。
 
 `N=16384` 时 speedup 为 `1.43x`，满足作业要求的 `>=1.20x`。随着序列长度继续增加，int8 的 speedup 提升到 `1.48x`。
 
