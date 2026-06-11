@@ -398,6 +398,25 @@ Block-Sparse 的速度收益来自减少参与计算的 K/V blocks。topk 越低
 
 ## 5. 总结
 
-本实验实现并测试了四类 attention 后端。Vanilla Attention 适合作为正确性参考，但速度较慢；Triton Flash Attention 2 在保持 dense attention 精度的同时显著减少访存开销，整体速度接近或优于 SDPA；Block-Sparse Attention 可以通过降低 topk 减少计算量，在 `topk=0.5` 时取得较好的速度-质量平衡；Sparse Int8 在 PixArt-Alpha 的短序列 T2I 推理中收益有限，但在长序列 benchmark 中加速明显。
+### 5.1 有效设计
 
-整体来看，attention 优化可以从三个方向入手：一是通过 Flash Attention 改善 dense attention 的访存模式；二是通过 sparse selection 减少参与计算的 token blocks；三是通过 int8 量化提升长序列场景下的矩阵乘吞吐。不同方法的适用场景不同，需要结合序列长度、精度要求和固定开销综合选择。
+- **Triton Flash Attention 2 的分块计算和 online softmax 是最稳定有效的 dense attention 优化。** 它不改变 attention 的数学形式，FA2 与 SDPA 的 CosSim 为 `1.000000`，同时避免显式保存完整 `N x N` attention matrix，显著减少 HBM 读写。T2I 中 FA2 平均 `22.001s/image`，远快于 Vanilla 的 `54.203s/image`，并且满足速度阈值。
+- **Block-Sparse Attention 的 block selection 能有效提供速度-质量折中。** 降低 `topk_ratio` 会减少参与计算的 K/V blocks，`topk=0.5` 相比 `topk=1.0` 快约 `22.2%`，同时仍能保持 prompt 的主体语义；`topk=0.8/0.9` 的质量更接近 dense attention。
+- **Sparse Int8 的 Q/K per-block 量化在长序列上有效。** 当 `N=16384` 时，Sparse Int8 相比 fp16 Sparse 达到 `1.43x` speedup，超过 `1.20x` 要求；随着 `N` 增大到 `32768`，speedup 进一步提升到 `1.48x`。
+- **Vanilla Attention 主要有效价值是正确性参考。** 它实现简单、语义清楚，适合验证公式和生成质量，但显式构造 attention matrix，速度明显不适合作为高性能推理后端。
+
+### 5.2 适用场景
+
+| 设计 | 更适合的场景 | 不适合或收益有限的场景 |
+|---|---|---|
+| Vanilla Attention | 小规模调试、正确性 baseline、对照 SDPA 数值行为 | 实际 T2I 推理和长序列 benchmark，显存访问和中间矩阵开销过大 |
+| Triton Flash Attention 2 | 需要保持 dense attention 精度、生成质量要求高、希望接近或优于 SDPA 速度的通用场景 | 如果需要进一步牺牲少量质量换取更大速度收益，仅 dense 优化不够 |
+| Block-Sparse Attention | 允许轻微质量变化、希望通过 `topk_ratio` 控制速度-质量平衡的 T2I 或长序列场景；本实验中 `topk=0.5` 是较好的 T2I 折中点 | `topk=0.3` 过稀疏时容易丢失纹理、背景连续性和小物体细节 |
+| Sparse Int8 Attention | `N >= 16384` 等长序列、QK 计算和访存成为主要瓶颈、硬件 int8 tensor core 能充分发挥的场景 | PixArt-Alpha 当前短序列 T2I 中收益有限，因为量化、scale 计算和 kernel launch 等固定开销占比较高 |
+
+### 5.3 主要观察
+
+- **Attention 优化不是单一维度问题，而是“访存、计算量、近似误差、固定开销”的共同权衡。** FA2 主要优化访存模式，Sparse 主要减少计算 blocks，Int8 主要提升长序列矩阵乘吞吐。
+- **稀疏度越高，速度通常越快，但质量下降首先体现在细节层面。** `topk=0.3` 容易出现纹理丢失、背景不连续和局部伪影；`topk=0.8/0.9` 与 `topk=1.0` 在两个示例 prompt 上视觉差异很小，但速度收益也更小。
+- **短序列和长序列的最优后端不同。** 短序列下 fixed overhead 会削弱 sparse/int8 的优势；长序列下 QK/PV 的计算和访存占主导，Sparse Int8 的收益更明显。
+- **高性能 attention 后端需要按任务选择。** 如果目标是最高保真，应优先使用 SDPA/FA2 或 Sparse `topk=1.0/0.9`；如果目标是 T2I 推理速度与质量折中，可选 Sparse `topk=0.5`；如果目标是长序列吞吐，应优先考虑 Sparse Int8。
