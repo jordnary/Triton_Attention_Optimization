@@ -325,19 +325,31 @@ Benchmark 设置为 `B=2`、fp16、warmup 10、iterations 50，测试 `N ∈ {20
 
 ### 3.2 达标情况
 
+#### 3.2.1 速度达标
+
 速度方面，`benchmark_attention.py` 中所有被测后端在 16 个 `(H,N,D)` 配置下均满足“不低于 SDPA 40%”的要求。全部结果中的最低 speedup 为 `0.597x`，出现在短序列配置 `H=8,N=2048,D=128` 的 `sparse_int8(topk=0.3)`；该值仍高于 `0.4x` 的速度阈值。
 
-| 后端 | 结果 |
-|---|---|
-| Triton FA2 | 16 个配置全部满足速度与精度要求；最小 speedup 为 `0.964x`，最大 RelL1 为 `5.22e-05`。 |
-| Sparse topk=1.0 | 16 个配置全部满足 dense 等价验证；最小 speedup 为 `0.950x`。 |
-| Sparse topk=0.8 | 16 个配置全部满足精度要求；最小 CosSim 为 `0.8995`，最大 RelL1 为 `0.488`。 |
-| Sparse Int8 topk=1.0 | 16 个配置全部满足 int8 精度要求；最小 CosSim 为 `0.999916`，最大 RelL1 为 `0.01286`。 |
-| Sparse Int8 topk=0.8 | 16 个配置全部满足稀疏 int8 精度要求；最小 CosSim 为 `0.899439`，最大 RelL1 为 `0.488`。 |
+| 后端 | 速度阈值 | 结果 |
+|---|---|---|
+| Triton FA2 | speedup ≥ `0.4x` | 16 个配置全部达标，最小 speedup 为 `0.964x`。 |
+| Sparse topk=1.0 | speedup ≥ `0.4x` | 16 个配置全部达标，最小 speedup 为 `0.950x`。 |
+| Sparse topk=0.8 | speedup ≥ `0.4x` | 16 个配置全部达标，最小 speedup 为 `1.14x`。 |
+| Sparse Int8 topk=1.0 | speedup ≥ `0.4x` | 16 个配置全部达标，最小 speedup 为 `1.04x`。 |
+| Sparse Int8 topk=0.8 | speedup ≥ `0.4x` | 16 个配置全部达标，最小 speedup 为 `0.91x`。 |
+
+少数短序列配置中，`topk=0.8` 相比 `topk=1.0` 的 kernel 计时没有严格更快，主要原因是 block selection、量化和 kernel launch 等固定开销占比较高。在 `N>=4096` 以及 T2I 主实验中，降低 topk 带来的速度收益更稳定。
+
+#### 3.2.2 精度达标
 
 精度方面，FA2 与 Sparse topk=1.0 的 CosSim 均为 `1.000000`，RelL1 远低于 `1e-3`；Sparse topk=0.8 的 CosSim 均高于 `0.8`，RelL1 均低于 `1.0`；Sparse Int8 topk=1.0 的 CosSim 均高于 `0.99`，RelL1 均低于 `2e-2`；Sparse Int8 topk=0.8 的 CosSim 和 RelL1 也满足稀疏近似设置下的要求。
 
-少数短序列配置中，`topk=0.8` 相比 `topk=1.0` 的 kernel 计时没有严格更快，主要原因是 block selection、量化和 kernel launch 等固定开销占比较高。在 `N>=4096` 以及 T2I 主实验中，降低 topk 带来的速度收益更稳定。
+| 后端 | 精度阈值 | 结果 |
+|---|---|---|
+| Triton FA2 | CosSim > `0.99`，RelL1 < `1e-3` | 16 个配置全部达标，CosSim 均为 `1.000000`，最大 RelL1 为 `5.22e-05`。 |
+| Sparse topk=1.0 | CosSim > `0.99`，RelL1 < `1e-3` | 16 个配置全部达标，CosSim 均为 `1.000000`，最大 RelL1 为 `5.22e-05`。 |
+| Sparse topk=0.8 | CosSim > `0.8`，RelL1 < `1.0` | 16 个配置全部达标，最小 CosSim 为 `0.8995`，最大 RelL1 为 `0.488`。 |
+| Sparse Int8 topk=1.0 | CosSim > `0.99`，RelL1 < `2e-2` | 16 个配置全部达标，最小 CosSim 为 `0.999916`，最大 RelL1 为 `0.01286`。 |
+| Sparse Int8 topk=0.8 | CosSim > `0.8`，RelL1 < `1.0` | 16 个配置全部达标，最小 CosSim 为 `0.899439`，最大 RelL1 为 `0.488`。 |
 
 ### 3.3 test_sparse_int8.py 长序列加速
 
