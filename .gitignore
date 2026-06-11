@@ -7,6 +7,6 @@ __pycache__/
 
 output/
 pretrained_models/
-doc/
-pic/
+doc/*
+!doc/report.md
 benchmark_results.*
