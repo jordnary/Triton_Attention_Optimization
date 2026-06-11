@@ -351,7 +351,7 @@ Block-Sparse 的速度收益来自减少参与计算的 K/V blocks。topk 越低
 
 综合生成效果和速度，本实验认为 `topk=0.5` 是 PixArt-Alpha T2I 场景下较合适的折中点。
 
-### 4.3 Int8 长序列加速分析
+### 4.3 Int8 量化短序列慢、长序列快的原因
 
 **为什么短序列时 int8 反而比 fp16 慢？** Sparse Int8 的耗时主要包括 Q/K 量化、block selection 和 int8 attention kernel 三部分。短序列时 attention 的矩阵乘计算量还不大，fp16 sparse kernel 本身已经很快；此时 Q/K per-block 量化、scale 计算、数据转换以及 kernel launch 等固定开销占比较高，int8 tensor core 节省下来的计算时间不足以抵消这些额外开销。因此在部分短序列配置中，int8 会反而慢于 fp16，例如 `H=8,N=2048,D=128,topk=0.8` 时，fp16 sparse 为 `2.001 ms`，sparse int8 为 `2.624 ms`。
 
