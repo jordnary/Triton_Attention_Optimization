@@ -27,7 +27,11 @@
 
 Sparse attention 的 topk 消融结果如下。topk 越低，参与 attention 的 K/V blocks 越少，速度越快，但图像细节和构图变化越明显。topk=0.8/0.9 与 topk=1.0 更接近，但速度收益较小。
 
+**图 2-2 Sparse topk prompt 000**：`A majestic lion standing on a rocky cliff at sunset...` 在不同 `topk_ratio` 下的生成结果。
+
 ![Sparse topk prompt 000](../pic/sparse_topk_prompt000.jpg)
+
+**图 2-3 Sparse topk prompt 001**：`A cozy cottage in a snowy forest...` 在不同 `topk_ratio` 下的生成结果。
 
 ![Sparse topk prompt 001](../pic/sparse_topk_prompt001.jpg)
 
@@ -69,7 +73,7 @@ Sparse Int8 在 `topk_ratio ∈ {0.3, 0.5, 0.8, 0.9, 1.0}` 五组设置下均能
 
 从速度曲线可以看出，topk 越大，平均采样时间越长。对于本次 T2I 推理，Sparse topk=0.5 在质量和速度之间取得了较好的折中：相比 topk=0.3，图像语义和构图更稳定；相比 topk=1.0，采样时间明显下降。Sparse Int8 的曲线整体略低于 fp16 sparse，但由于 PixArt 当前序列长度不算特别长，int8 的优势并没有像长序列 benchmark 中那样明显。
 
-**效果对比（对应评分点：至少 2 个 prompt + 不同 topk 图像 + 稀疏度质量分析）**：上文的 `Sparse topk prompt 000` 和 `Sparse topk prompt 001` 分别展示了两个 prompt 在 `topk_ratio ∈ {0.3, 0.5, 0.8, 0.9, 1.0}` 下的生成图像。可以看到，降低 topk 并不会立刻破坏 prompt 的主体语义，但会优先影响全局构图稳定性、背景连贯性以及局部纹理细节。
+**效果对比**：上文 **图 2-2 Sparse topk prompt 000** 和 **图 2-3 Sparse topk prompt 001** 分别展示了两个 prompt 在 `topk_ratio ∈ {0.3, 0.5, 0.8, 0.9, 1.0}` 下的生成图像。可以看到，降低 topk 并不会立刻破坏 prompt 的主体语义，但会优先影响全局构图稳定性、背景连贯性以及局部纹理细节。
 
 | Prompt | topk=0.3 | topk=0.5 | topk=0.8 | topk=0.9 vs 1.0 |
 |---|---|---|---|---|
