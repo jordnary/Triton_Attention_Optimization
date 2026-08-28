@@ -6,19 +6,7 @@
 
 **硬件要求**：本项目已经过显存优化（VAE 和 DiT 模型动态 offloading），推荐使用 **NVIDIA RTX 3070 (8GB)** 或更高显存的显卡。峰值显存约 7GB，可在 8GB 显存的 GPU 上运行。
 
----
-
-## 示例生成结果
-
-<p align="center">
-  <img src="data/sample0.jpg" width="240" alt="Sample 0">
-  <img src="data/sample1.jpg" width="240" alt="Sample 1">
-  <img src="data/sample2.jpg" width="240" alt="Sample 2">
-  <br>
-  <em>PixArt-Alpha 使用不同 prompts 的生成示例</em>
-</p>
-
-**注意**：本项目直接使用预先提取好的 T5 embeddings（保存在 `data/prompt_embeddings/`），无需在线调用 T5 encoder。PixArt-Alpha 原本使用 T5-XXL encoder（参数量较大，需要 >20GB 显存），为了方便实验，我们已为 20 个测试 prompts 预先提取了 embeddings（`prompt_000.pt` 到 `prompt_019.pt`），可以在显存较小的 GPU（如 RTX 3070）上运行。
+**注意**：模型权重、T5 embeddings 和推理输出不随仓库提交。运行 T2I 实验前，请按 [data/task1.md](data/task1.md) 准备预训练模型，并将 20 个测试 prompts 的 embeddings 放入 `data/prompt_embeddings/`；embeddings 可使用 [PixArt-alpha/scripts/save_t5_embeddings.py](PixArt-alpha/scripts/save_t5_embeddings.py) 重新生成。
 
 ---
 
@@ -171,7 +159,7 @@ python test_t2i.py --attention_mode sparse_int8 --topk_ratio 0.5
 | [PixArt-alpha/](PixArt-alpha/) | PixArt-Alpha 模型代码（已提供） |
 | [data/task1.md](data/task1.md) | 任务 1 详细说明 |
 | [data/task2.md](data/task2.md) | 任务 2 详细说明 |
-| [data/prompt_embeddings/](data/prompt_embeddings/) | 预提取的 T5 embeddings（20 个 prompts） |
+| `data/prompt_embeddings/` | 本地生成的 T5 embeddings（不随仓库提交） |
 | [requirements.txt](requirements.txt) | Python 依赖列表 |
 
 ---
@@ -215,7 +203,7 @@ python test_sparse_int8.py --seq-lens 1024 2048 4096 8192 16384 32768
 - **速度测量**：所有速度测量均在**相同 GPU、相同 prompt、相同随机种子**下进行，以保证可比性。
 - **Triton 版本**：本仓库使用 Triton 3.4.0，CUDA 12.6。如使用其他版本请在报告中说明。
 - **硬件环境**：建议在 **NVIDIA RTX 3070** 或同等算力 GPU 上测试。报告中需注明实际使用的 GPU 型号。
-- **预提取 embeddings**：本项目使用 `data/prompt_embeddings/` 中预先提取好的 T5 embeddings（20 个 prompts），无需在线调用 T5 encoder，可在 8GB 显存的 GPU 上运行。
+- **预提取 embeddings**：T2I 实验从 `data/prompt_embeddings/` 读取 20 个 prompts 的 embeddings；该目录为本地生成内容，不随仓库提交。
 - **助教将会抽查提交的代码**。对于与报告内容严重不符、抄袭、违反诚信的内容予以严肃处理。
 
 ---

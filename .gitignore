@@ -1,12 +1,31 @@
 __pycache__/
 *.py[cod]
+*.pyd
+*.so
 
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
+
+build/
+dist/
+*.egg-info/
 
 output/
 pretrained_models/
+data/prompt_embeddings/
+checkpoints/
+runs/
+wandb/
+lightning_logs/
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+*.log
 doc/*
 !doc/report.md
+!doc/report.pdf
 benchmark_results.*
