@@ -1,22 +1,40 @@
+# Python environments, bytecode and tool caches
 __pycache__/
 *.py[cod]
 *.pyd
 *.so
-
+.venv*/
+venv/
+env/
+ENV/
+.conda/
+.python-version
+.ipynb_checkpoints/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.coverage
+.cache/
+.triton/
+.torch/
+.nv/
+torch_compile_debug/
+.tox/
+.nox/
+.coverage*
 htmlcov/
+coverage.xml
 
+# Build artifacts
 build/
 dist/
 *.egg-info/
 
-output/
+# Model assets and reproducible experiment outputs
 pretrained_models/
-data/prompt_embeddings/
 checkpoints/
+/data/prompt_embeddings/
+output/
+outputs/
 runs/
 wandb/
 lightning_logs/
@@ -24,8 +42,65 @@ lightning_logs/
 *.pth
 *.pt
 *.safetensors
+*.onnx
+*.engine
+*.bin
 *.log
-doc/*
-!doc/report.md
-!doc/report.pdf
 benchmark_results.*
+sparse_int8_results.*
+
+# Local report exports and raw measurements; Markdown and pic/ remain public
+/doc/*.pdf
+/doc/*.html
+/doc/*.csv
+/doc/*.txt
+/doc/*.aux
+/doc/*.out
+/doc/*.toc
+/doc/*.synctex.gz
+/doc/*_files/
+/doc/.rendered/
+
+# Private notes, submission copies and release staging
+/local/
+*.local.md
+AGENTS.md
+.codex/
+.claude/
+
+# Credentials, local configuration and databases
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.csr
+id_rsa*
+id_ed25519*
+.netrc
+credentials.json
+secrets.json
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Editor, OS and temporary files
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+*.tmp
+*.bak
+~$*

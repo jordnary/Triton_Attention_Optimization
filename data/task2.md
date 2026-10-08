@@ -1,213 +1,80 @@
-# 任务 2：Attention Benchmark 测评
+# Attention 算子评估方法
 
-**总分：20 分**
+实验使用合成 Q/K/V 张量测量前向延迟，以 PyTorch SDPA 输出作为数值参考，不需要模型权重。运行环境见[环境配置](env_install.md)。
 
-本任务要求对已实现的 Attention 变体进行系统性的性能测评，量化分析各实现在不同配置下的速度和精度表现。
+## 1. 多后端基准
 
----
+`benchmark_attention.py` 评估 SDPA、Triton FA2、Sparse 和 Sparse Int8。虽然脚本导入了 Vanilla，其注册项当前被注释，默认结果不包含该后端。
 
-## 子任务 2.1：速度与精度评估（15 分）
+| 参数 | 默认值 |
+| --- | --- |
+| `--batch` | 2 |
+| `--seq-lens` | 2048、4096、8192、16384 |
+| `--num-heads` | 8、16 |
+| `--head-dims` | 64、128 |
+| `--topk-ratios` | 0.3、0.5、0.8、0.9、1.0 |
+| `--dtype` | `fp16` |
+| `--warmup` / `--iters` | 10 / 50 |
 
-### 要求
-
-使用 `benchmark_attention.py` 对 `triton_fa2`、`sparse`、`sparse_int8` 三种实现进行 benchmark，与 SDPA baseline 对比。
-
-**测试配置**（脚本默认值）：
-- **序列长度**：N ∈ {2048, 4096, 8192, 16384}
-- **Head 数量**：H ∈ {8, 16}
-- **Head 维度**：D ∈ {64, 128}
-- **数据类型**：fp16
-- **Batch size**：2
-- **topk_ratio**：{0.3, 0.5, 0.8, 0.9, 1.0}（sparse / sparse_int8 各跑一组）
-- **Warmup**：10，**Iterations**：50
-
-**运行命令**：
+每个形状重新设置随机种子为 0，从标准正态分布生成 Q/K/V。默认遍历 16 种形状、每种 12 个后端配置。
 
 ```bash
-# 完整 benchmark（使用脚本默认配置）
-python benchmark_attention.py --txt benchmark_results.txt --csv benchmark_results.csv
-
-# 快速测试（可选，用于调试）
-python benchmark_attention.py --seq-lens 2048 --num-heads 8 --head-dims 64 --warmup 3 --iters 10
+python benchmark_attention.py --txt output/benchmark_results.txt --csv output/benchmark_results.csv
 ```
 
-**输出指标**：
-- **时间**：每个 backend 的前向传播延迟（ms/forward）
-- **vs SDPA**：相对 SDPA 的加速比（speedup = time_sdpa / time_backend）
-- **CosSim**：Cosine Similarity（越接近 1.0 越好）
-- **RelL1**：Relative L1 = Σ|O-O'| / Σ|O|（越小越好）
-- **RMSE**：Root Mean Square Error（越小越好）
-
-### 评分标准（15 分）
-
-#### (1) Triton Flash Attention 2 vs SDPA（5 分）
-
-**要求**：
-- **速度**（3 分）：在所有 (H, N, D) 配置下，`triton_fa2` 的速度**不低于 SDPA 的 40%**（即 speedup ≥ 0.4，time ≤ 2.5x SDPA）。
-- **精度**（2 分）：
-  - CosSim > 0.99
-  - RelL1 < 1e-3
-
-**示例输出**（RTX A6000 实测，期望通过的 case）：
-```
-[B=2, H=8, N=8192, D=64]
-  backend                  time (ms)   vs SDPA        CosSim         RelL1          RMSE
-  sdpa                        2.6768     1.00x         (ref)         (ref)         (ref)
-  triton_fa2                  3.4213     0.78x      1.000000      2.75e-04      7.03e-06
-```
-→ 速度 0.78x（> 0.4 ✓），CosSim 1.000000（> 0.99 ✓），RelL1 2.75e-4（< 1e-3 ✓）
-
-**提示**：
-- 如果速度不达标，检查：(1) Triton kernel 是否正确编译并在 GPU 运行；(2) BLOCK_M / BLOCK_N / num_warps 参数是否合理。
-- CosSim 和 RelL1 应该非常接近（Flash Attention 是精确算法，只有舍入误差）。
-
----
-
-#### (2) Sparse Attention (topk=1.0 / 0.8) vs SDPA（5 分）
-
-**要求**：
-
-**topk=1.0（选择所有 blocks）**：
-- **速度**（1.5 分）：不低于 SDPA 的 40%。
-- **精度**（1.5 分）：
-  - CosSim > 0.99
-  - RelL1 < 1e-3
-
-**topk=0.8（稀疏 20%）**：
-- **速度**（1 分）：相比 topk=1.0 有加速（speedup vs topk=1.0 > 1.0）。
-- **精度**（1 分）：
-  - CosSim > 0.8
-  - RelL1 < 1.0
-
-**示例输出**（RTX A6000 实测）：
-```
-[B=2, H=8, N=8192, D=64]
-  backend                  time (ms)   vs SDPA        CosSim         RelL1          RMSE
-  sdpa                        2.6768     1.00x         (ref)         (ref)         (ref)
-  sparse(topk=0.8)            2.7829     0.96x      0.899157      4.87e-01      9.07e-03
-  sparse(topk=1.0)            3.4392     0.78x      1.000000      2.25e-04      6.25e-06
-```
-→ topk=1.0 速度 0.78x（> 0.4 ✓），CosSim 1.000000（> 0.99 ✓），RelL1 2.25e-4（< 1e-3 ✓）  
-→ topk=0.8 相比 1.0 更快（2.78 vs 3.44，speedup 1.24x > 1.0 ✓），CosSim 0.90（> 0.8 ✓），RelL1 0.49（< 1.0 ✓）
-
-**提示**：
-- Sparse Attention 的 block selection 开销在当前实现中较大（PyTorch `topk`），导致 topk=1.0 也比 FA2 慢。
-- topk=0.8 vs 1.0 的加速幅度取决于 N：N 越大，稀疏的收益越明显。
-- CosSim 和 RelL1 在 topk < 1.0 时会下降，这是稀疏近似的必然代价。
-
----
-
-#### (3) Sparse Int8 (topk=1.0 / 0.8) vs SDPA（5 分）
-
-**要求**：
-
-与子任务 (2) 相同，但测试的是 `sparse_int8` backend：
-
-**topk=1.0**：
-- **速度**（1.5 分）：不低于 SDPA 的 40%。
-- **精度**（1.5 分）：
-  - CosSim > 0.99（int8 量化会引入额外误差）
-  - RelL1 < 2e-2（int8 量化误差比 fp16 高一个数量级）
-
-**topk=0.8**：
-- **速度**（1 分）：相比 topk=1.0 有加速。
-- **精度**（1 分）：
-  - CosSim > 0.8
-  - RelL1 < 1.0
-
-**示例输出**（RTX A6000 实测）：
-```
-[B=2, H=8, N=8192, D=64]
-  backend                  time (ms)   vs SDPA        CosSim         RelL1          RMSE
-  sdpa                        2.6768     1.00x         (ref)         (ref)         (ref)
-  sparse_int8(topk=0.8)       2.2471     1.19x      0.899103      4.87e-01      9.07e-03
-  sparse_int8(topk=1.0)       2.7186     0.98x      0.999925      1.21e-02      2.27e-04
-```
-→ topk=1.0 速度 0.98x（> 0.4 ✓），CosSim 0.999925（> 0.99 ✓），RelL1 1.21e-2（< 2e-2 ✓）  
-→ topk=0.8 相比 1.0 更快（2.25 vs 2.72，speedup 1.21x > 1.0 ✓），CosSim 0.90（> 0.8 ✓），RelL1 0.49（< 1.0 ✓）
-
-**注意**：
-- Int8 的耗时由「Q/K 量化（与 topk 无关的固定开销）+ block selection + attention kernel（随 topk 变化）」组成。在长序列（如 N=8192）下 attention 计算占主导，因此 sparse_int8 的耗时随 topk 正常变化。
-- 但在**短序列**（如 N ≤ 2048）下，固定的量化开销占主导，会出现「不同 topk 下耗时几乎相同」的现象——这是正常的（量化整个 Q/K 的成本与选多少 block 无关），并非 bug。因此本子任务建议在 N ≥ 4096 上评测。
-- Int8 的精度要求比 fp16 宽松（topk=1.0 时 CosSim≈0.9999、RelL1≈1.2e-2）。
-
----
-
-## 子任务 2.2：Int8 长序列加速验证（5 分）
-
-### 要求
-
-使用 `test_sparse_int8.py` 测试 `sparse_int8` 相比 `sparse` (fp16) 在长序列下的加速表现。
-
-**测试配置**（脚本默认值）：
-- **序列长度**：N ∈ {1024, 2048, 4096, 8192, 16384, 32768}
-- **topk_ratio**：0.8
-- **Batch size**：2
-- **Head 数量**：16
-- **Head 维度**：64
-- **Warmup**：10，**Iterations**：30
-
-**运行命令**：
+检查非二次幂头维度时，可单独运行：
 
 ```bash
-# 使用脚本默认配置
-python test_sparse_int8.py
+python benchmark_attention.py --seq-lens 1024 --num-heads 8 --head-dims 72 --topk-ratios 0.8 1.0 --warmup 3 --iters 10
 ```
 
-结果会输出到终端并保存到 `output/sparse_int8_results.txt`。可以用 `--txt` 指定其他路径。
+每个后端预热后，用 CUDA events 记录连续前向调用总时间并除以迭代次数。Sparse 的块选择、Sparse Int8 的块选择与量化均包含在被计时调用中；所得数据不是单个 Triton 内核的独立耗时。计时不含预热与首次 JIT 编译。
 
-**输出指标**：
-- 每个 N 下，`sparse` (fp16) 和 `sparse_int8` 的时间（ms）
-- Speedup = time_fp16 / time_int8（> 1.0 表示 int8 更快）
+默认文本结果写入 `output/benchmark_results.txt`，CSV 需显式指定。脚本只自动创建 `output/`；其他输出父目录须事先存在。`FAILED` 配置不能作为有效性能记录。
 
-### 评分标准（5 分）
+## 2. 数值指标
 
-**要求**：
-- 当 **N ≥ 16384**（16k tokens）时，`sparse_int8` 的速度比 `sparse` (fp16) **快 20% 以上**（即 speedup ≥ 1.20，time_int8 ≤ 0.83 * time_fp16）。
-- **提交分析**：在实验报告中分析以下问题：
-  1. **为什么短序列时 int8 反而比 fp16 慢？** 从量化开销和计算开销两方面解释。
-  2. **为什么长序列时 int8 能加速？** 说明 int8 的加速来源（访存带宽、tensor core 吞吐）。
-  3. **从你的实验数据看，int8 加速的"拐点"在哪里？**（即从哪个 N 开始 speedup > 1.0）
+将 SDPA 参考输出记为 `R`、被测输出记为 `O`，展平并转换为 FP32 后计算：
 
-**示例输出**（RTX A6000 实测，B=2, H=16, D=64, topk=0.8）：
+| 指标 | 定义 | 解释 |
+| --- | --- | --- |
+| CosSim | `sum(R * O) / (sqrt(sum(R²)) * sqrt(sum(O²)) + ε)` | 越接近 1，方向越一致 |
+| RelL1 | `sum(abs(O - R)) / (sum(abs(R)) + ε)` | 相对绝对误差，越小越好 |
+| RMSE | `sqrt(mean((O - R)²))` | 均方根误差，越小越好 |
+| Speedup | `T_SDPA / T_backend` | 大于 1 表示比 SDPA 更快 |
+
+脚本采用 `ε=1e-12`。SDPA 实际内核由 PyTorch 选择，代码未固定某一种实现；比较结果与框架版本、GPU 及形状有关。
+
+Sparse 的块裁剪误差与 Sparse Int8 额外引入的量化误差应分别解释，不能仅凭速度评价优劣。
+
+## 3. Sparse Int8 长序列比较
+
+`test_sparse_int8.py` 在相同块保留比例下比较浮点 Sparse 与 Sparse Int8。
+
+| 参数 | 默认值 |
+| --- | --- |
+| `--batch` / `--num-heads` / `--head-dim` | 2 / 16 / 64 |
+| `--seq-lens` | 1024、2048、4096、8192、16384、32768 |
+| `--topk-ratio` | 0.8 |
+| `--dtype` | `fp16` |
+| `--warmup` / `--iters` | 10 / 30 |
+
+```bash
+python test_sparse_int8.py --seq-lens 1024 2048 4096 8192 16384 32768 --topk-ratio 0.8 --txt output/sparse_int8_results.txt
 ```
-     N |   sparse(fp16) |    sparse_int8 |    speedup |     CosSim |        RelL1 |         RMSE
-  1024 |      0.330 ms |      0.433 ms |    0.76x ✗ |   0.872375 | 5.59e-01 | 2.94e-02
-  2048 |      0.555 ms |      0.597 ms |    0.93x ✗ |   0.887944 | 5.18e-01 | 1.90e-02
-  4096 |      1.492 ms |      1.284 ms |    1.16x ✓ |   0.898414 | 4.89e-01 | 1.28e-02
-  8192 |      5.431 ms |      4.387 ms |    1.24x ✓ |   0.896805 | 4.95e-01 | 9.06e-03
- 16384 |     22.044 ms |     16.837 ms |    1.31x ✓ |   0.897492 | 4.93e-01 | 6.41e-03
- 32768 |     92.716 ms |     68.073 ms |    1.36x ✓ |   0.900066 | 4.86e-01 | 4.51e-03
-```
-→ 短序列（N ≤ 2048）int8 比 fp16 慢（0.76x / 0.93x），N=4096 起开始反超；
-  N=16384 时 speedup 1.31x（> 1.20 ✓），N=32768 时 1.36x（> 1.20 ✓）
 
-**提示**：
-- Int8 的加速在长序列上才显现（计算量大，量化开销被摊销）。
-- 如果 N=16384 仍未达标，检查：
-  1. 量化是否在每次 forward 都重新计算？（应该只量化一次）
-  2. Block selection 是否成为瓶颈？（PyTorch `topk` 在长序列上很慢）
-- 报告中需附上 **N vs speedup 曲线**，展示 int8 的加速随序列长度增长的趋势。
+脚本在预热后逐次计时，对排序后的样本裁剪尾部并求平均。默认 30 次迭代时，两端各剔除 3 个样本；建议保持默认值，或采用不小于 10 的 10 的整数倍，以避免现有切片实现产生非对称裁剪。
 
----
+此处 Speedup 为 `T_sparse / T_sparse_int8`；精度指标仍是 Sparse Int8 相对 SDPA 的误差。因此速度基准与数值参考不同，误差也不只是量化误差。
 
-## 提交清单
+默认输出为 `output/sparse_int8_results.txt`。`--dtype bf16` 可选择 BF16 输入，但表头仍写作 `sparse(fp16)`；解释结果应以配置行中的 dtype 为准。
 
-将以下内容整理到**实验报告**中：
+## 4. 结果解释与局限
 
-| 内容 | 子任务 | 说明 |
-| ---- | ---- | ---- |
-| `benchmark_attention.py` 结果表 | 2.1 | 所有 backend 在不同 (H, N, D) 下的速度/精度对比 |
-| 速度达标情况说明 | 2.1 | 各 backend 是否满足 "不低于 SDPA 40%" 要求 |
-| 精度达标情况说明 | 2.1 | CosSim / RelL1 是否满足阈值 |
-| `test_sparse_int8.py` 结果 | 2.2 | N vs speedup 表格或曲线图 |
-| Int8 长序列加速分析 | 2.2 | N ≥ 16k 时是否达到 1.2x 加速，原因分析 |
+- 固定形状、精度、随机种子、预热和迭代次数，避免其他 GPU 工作负载。
+- 当前脚本报告单次实验均值，没有独立重复实验的置信区间。小幅时间差异不足以证明稳定优势。
+- 随机张量与扩散模型真实激活分布不同，算子误差不能直接推导图像质量。
+- 短序列中的块选择、量化和 kernel launch 开销可能抵消收益，Int8 不保证在所有形状上加速。
+- `D=72` 补充命令用于检查实现覆盖，不属于既有报告中 `D∈{64,128}` 的基准统计。
 
----
-
-## 调试建议
-
-1. **对比 SDPA**：如果某个 backend 的 CosSim < 0.99，用小数据（N=256）逐元素对比输出，定位数值错误。
-2. **速度异常慢**：检查 Triton kernel 是否正确编译（看终端是否有 warning），用 `nvidia-smi` 确认 GPU 利用率。
-
-祝实验顺利！
+完整结果见[实验报告](../doc/report.md)。

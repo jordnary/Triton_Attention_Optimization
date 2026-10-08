@@ -1,49 +1,65 @@
-# CM2026 Project 2 实验报告
+# Attention 算子与 PixArt-α 推理实验报告
 
+## 摘要
 
+本实验比较 PyTorch Vanilla、Triton FA2、Block-Sparse 与 Sparse Int8 四种实现，以 PyTorch SDPA 为参考，评估文生图采样时间、生成结果与合成张量上的数值误差。实验覆盖 20 个提示词、五种块保留比例，以及不同序列长度、头数和头维度。
 
-## 1. 实验设置
+既有记录中，Triton FA2 平均采样时间为 22.001 s/image，Vanilla 为 54.203 s/image，SDPA 为 20.419 s/image。Sparse 的块保留比例从 1.0 降至 0.5 后，时间从 22.868 降至 17.792 s/image，降幅约 22.2%，同时生成图像构图与细节出现变化。在 N=32768 的长序列比较中，Sparse Int8 相对 FP16 Sparse 达到 1.48× 加速。
 
-本实验实现并评估了以下 Attention 后端：
+本报告保留既有实验的数值表格与图表，对公开版本叙述和身份字段作整理；文档整理期间未重新运行 GPU 实验。
 
-- Vanilla Attention：使用 PyTorch 张量运算实现标准 scaled dot-product attention。
-- Triton Flash Attention 2：使用 Triton 实现 forward-only 的分块 dense attention。
-- Block-Sparse Attention：使用 block selection 选择 K/V blocks，并使用 Triton kernel 计算稀疏 attention。
-- Sparse Int8 Attention：在 block-sparse attention 基础上，对 Q/K 做 per-block int8 量化，V 保持 fp16。
+## 1. 实验方法与记录边界
 
-| 项目 | 配置 |
-|---|---|
-| Triton | 3.4.0 |
-| CUDA | 13.0 |
-| GPU | CUDA-capable GPU |
+### 1.1 实现
 
-## 2. 任务 1：T2I 生成结果
+- Vanilla 显式计算完整注意力矩阵，以 FP32 执行 score、softmax 与加权求和。
+- Triton FA2 使用分块计算与在线 softmax，实现稠密注意力前向传播。
+- Block-Sparse 以 Q/K 块均值估计相关性，为每个查询块选择 top-k K/V 块。
+- Sparse Int8 沿用块选择，对 Q/K 分块量化，QK 使用 Int8 乘法与 Int32 累加；softmax 与 PV 仍为浮点计算。
 
-### 2.1 生成质量对比
+文生图只替换 PixArt-α 的 self-attention，cross-attention 保持 SDPA。Triton 实现面向无自定义 mask 的非因果前向推理，未实现反向传播。功能范围与来源见 [README](../README.md) 和[来源说明](../THIRD_PARTY.md)。
 
-图 2-1 展示同一 prompt 在主要 attention 后端下的生成结果。SDPA、Vanilla、Triton FA2、Sparse topk=1.0 和 Sparse Int8 topk=1.0 的主体结构和语义基本一致；当 topk 降到 0.5 时，图像仍能保持 prompt 语义，但构图和局部细节会出现更明显变化。
+### 1.2 环境与复现范围
 
-**图 2-1 T2I attention comparison**：同一 prompt 在 SDPA、Vanilla、Triton FA2、Sparse 和 Sparse Int8 后端下的生成质量对比。
+原始记录注明 Triton 3.4.0 和 CUDA 13.0；依赖安装说明则使用 PyTorch 2.8.0 的 cu126 构建。CUDA 13.0 未注明对应驱动支持版本还是 Toolkit 版本，两者不能直接等同。公开版本不保留可识别本地设备的字段，因此绝对耗时仅作为该次实验记录，不用于跨设备性能排序。
 
-![T2I attention comparison](../pic/t2i_attention_prompt000.jpg)
+当前推理脚本默认使用图像基准尺寸 1024、批量 1、DPM-Solver 20 步、CFG scale 4.5、随机种子 0 和 FP16 模型权重。这些是源码默认值，不构成对全部历史运行参数的独立核验。复现方法见[环境配置](../data/env_install.md)、[文生图指南](../data/task1.md)和[算子评估方法](../data/task2.md)。
 
-Sparse attention 的 topk 消融结果见图 2-2 和图 2-3。topk 越低，参与 attention 的 K/V blocks 越少，速度越快，但图像细节和构图变化越明显。topk=0.8/0.9 与 topk=1.0 更接近，但速度收益较小。
+### 1.3 评价方法
 
-**图 2-2 Sparse topk prompt 000**：`A majestic lion standing on a rocky cliff at sunset...` 在不同 `topk_ratio` 下的生成结果。
+文生图时间覆盖采样分支及其 CUDA 同步，包括噪声初始化、采样器构建与扩散迭代，不含模型加载、文本编码、VAE 解码、模型搬移和文件保存。脚本未独立预热并剔除首图，首次 Triton 编译可能影响计时。
 
-![Sparse topk prompt 000](../pic/sparse_topk_prompt000.jpg)
+算子基准以 SDPA 为数值参考，报告 CosSim、RelL1 和 RMSE。多后端基准使用预热后的 CUDA events 平均计时；长序列比较对逐次时间排序后裁剪两端样本。块选择与量化包含在相应前向调用中。报告未提供独立重复实验的方差或置信区间。
 
-**图 2-3 Sparse topk prompt 001**：`A cozy cottage in a snowy forest...` 在不同 `topk_ratio` 下的生成结果。
+## 2. 文生图实验
 
-![Sparse topk prompt 001](../pic/sparse_topk_prompt001.jpg)
+### 2.1 生成结果比较
 
-Sparse Int8 的 topk 对比结果见图 2-4。在 `topk_ratio ∈ {0.3, 0.5, 0.8, 0.9, 1.0}` 五组设置下均能正常生成图像，没有出现 crash、NaN、全黑或全白结果。
+图 2-1 对比相同提示词在不同后端下的结果。SDPA、Vanilla、Triton FA2 和全块 Sparse 的主体结构与语义较接近。引入块裁剪或量化后，构图与局部细节可能变化；这些观察不代表像素级一致性。
 
-**图 2-4 Sparse Int8 topk prompt 000**：Sparse Int8 在 `prompt 000` 上不同 `topk_ratio` 的生成结果。
+**图 2-1：主要后端的文生图结果。**
 
-![Sparse int8 topk prompt 000](../pic/sparse_int8_topk_prompt000.jpg)
+![主要后端的文生图结果](../pic/t2i_attention_prompt000.jpg)
+
+图 2-2 与图 2-3 展示两个提示词的 Sparse 消融结果。较低块保留比例会更明显地影响纹理、背景连续性与主体比例。
+
+**图 2-2：Sparse 在提示词 000 下的块保留比例消融。**
+
+![Sparse 提示词 000](../pic/sparse_topk_prompt000.jpg)
+
+**图 2-3：Sparse 在提示词 001 下的块保留比例消融。**
+
+![Sparse 提示词 001](../pic/sparse_topk_prompt001.jpg)
+
+**图 2-4：Sparse Int8 在提示词 000 下的块保留比例消融。**
+
+![Sparse Int8 提示词 000](../pic/sparse_int8_topk_prompt000.jpg)
+
+图像评价基于展示样例的视觉观察，未计算 FID、CLIP score 或人类偏好分数，不据此推断所有提示词上的总体质量。
 
 ### 2.2 平均采样时间
+
+以下保留既有实验汇总。每项包含 20 张图；平均时间和总时间分别四舍五入，两者不必严格满足显示精度下的乘法关系。
 
 | Attention | topk | 图片数 | 平均采样时间 s/image | 总采样时间 s |
 |---|---:|---:|---:|---:|
@@ -61,38 +77,28 @@ Sparse Int8 的 topk 对比结果见图 2-4。在 `topk_ratio ∈ {0.3, 0.5, 0.8
 | Sparse Int8 | 0.9 | 20 | 20.856 | 417.119 |
 | Sparse Int8 | 1.0 | 20 | 21.309 | 426.179 |
 
-**图 2-5 T2I backend timing**：不同 attention 后端在 T2I 推理中的平均采样时间对比。
+**图 2-5：各后端的平均采样时间。**
 
-![T2I backend timing](../pic/t2i_backend_timing_bar.png)
+![各后端的平均采样时间](../pic/t2i_backend_timing_bar.png)
 
-主要结果如下：
+Triton FA2 的耗时约为 SDPA 的 1.08 倍、Vanilla 的 0.41 倍。Sparse 在 topk=0.5 下相对自身全块版本降低约 22.2% 耗时，对应约 1.29× 加速。Sparse Int8 在同一比例下为 17.237 s/image，较 FP16 Sparse 的 17.792 s/image 略低；没有重复统计时，不将小幅差异解释为普适优势。
 
-- Vanilla 平均 `54.203s/image`，约为 SDPA 耗时的 `2.65x`，速度最慢。
-- Triton FA2 平均 `22.001s/image`，约为 SDPA 耗时的 `1.08x`，满足“不超过 SDPA 2.5 倍”的要求。
-- Sparse topk=1.0 平均 `22.868s/image`，数值和生成效果接近 dense attention。
-- Sparse topk=0.5 平均 `17.792s/image`，相比 topk=1.0 快约 `22.2%`，满足 topk=0.5 至少加速 10% 的要求。
-- Sparse Int8 topk=0.5 平均 `17.237s/image`，略快于 fp16 sparse topk=0.5。
+### 2.3 块保留比例与图像变化
 
-### 2.3 topk 消融实验
+**图 2-6：Sparse 与 Sparse Int8 的采样时间随块保留比例变化。**
 
-**图 2-6 T2I topk timing curve**：Sparse 与 Sparse Int8 在不同 `topk_ratio` 下的平均采样时间曲线。
-
-![T2I topk timing curve](../pic/t2i_topk_timing_curve.png)
-
-从速度曲线可以看出，topk 越大，平均采样时间越长。对于本次 T2I 推理，Sparse topk=0.5 在质量和速度之间取得了较好的折中：相比 topk=0.3，图像语义和构图更稳定；相比 topk=1.0，采样时间明显下降。Sparse Int8 的曲线整体略低于 fp16 sparse，但由于 PixArt 当前序列长度不算特别长，int8 的优势并没有像长序列 benchmark 中那样明显。
-
-**效果对比**：上文 **图 2-2 Sparse topk prompt 000** 和 **图 2-3 Sparse topk prompt 001** 分别展示了两个 prompt 在 `topk_ratio ∈ {0.3, 0.5, 0.8, 0.9, 1.0}` 下的生成图像。可以看到，降低 topk 并不会立刻破坏 prompt 的主体语义，但会优先影响全局构图稳定性、背景连贯性以及局部纹理细节。
+![块保留比例与采样时间](../pic/t2i_topk_timing_curve.png)
 
 | Prompt | topk=0.3 | topk=0.5 | topk=0.8 | topk=0.9 vs 1.0 |
 |---|---|---|---|---|
 | prompt 000：`A majestic lion standing on a rocky cliff at sunset...` | 仍能看出狮子和落日语义，但主体比例和站姿不稳定；下半部分出现大面积模糊色块，岩石边缘、爪子、鬃毛纹理和悬崖细节明显丢失。 | 狮子主体、悬崖和夕阳背景基本恢复，语义正确；但构图与 dense 结果仍有差异，岩壁形状、背景山体和鬃毛层次不如高 topk 稳定。 | 主体结构、鬃毛、岩石纹理和夕阳光照已经接近 topk=1.0，仅有轻微构图和局部纹理差异。 | `topk=0.9` 与 `topk=1.0` 在视觉上基本无明显差异，狮子姿态、岩石边缘和背景光照都保持一致，差异主要是很小的亮度和纹理波动。 |
 | prompt 001：`A cozy cottage in a snowy forest...` | 小屋、雪地和暖色窗光仍然存在，但小屋比例偏小，森林层次、屋顶积雪、窗框细节、烟囱烟雾和前景雪地纹理明显简化。 | 小屋主体和暖光窗口更稳定，雪地与树木细节比 0.3 更完整；但前景雪纹、树枝轮廓和烟雾仍有模糊，整体空间层次弱于高 topk。 | 屋顶积雪、窗户暖光、烟囱、周围树木和雪地纹理都较清晰，整体观感接近 dense attention。 | `topk=0.9` 与 `topk=1.0` 几乎不可区分，小屋位置、屋顶积雪、窗光、森林背景和前景雪地都保持一致，没有可见的语义或质量退化。 |
 
-因此，从图像质量角度看，`topk=0.3` 的稀疏度过高，最容易丢失小尺度纹理和背景连续性，并可能产生局部伪影；`topk=0.5` 可以保留主体语义但仍会改变部分构图和细节；`topk=0.8` 已经接近 dense 结果；`topk=0.9` 与 `topk=1.0` 在这两个 prompt 上视觉差异很小，主要收益不再是质量提升，而是更接近 dense attention 的稳定性。
+上述定性描述仅对应展示的两个提示词。topk=0.5 在这些样例上保留主体语义并缩短采样时间，但仍有构图变化；topk=0.8/0.9 更接近全块结果。可接受比例取决于应用对一致性与时间的要求，本实验不足以确定通用最优值。
 
 ### 2.4 逐图采样时间
 
-下表汇总 20 张图在各 attention 后端下的采样时间，单位为秒。
+单位为秒，保留 20 张图的既有记录。
 
 | Image | SDPA | Vanilla | FA2 | Sparse0.3 | Sparse0.5 | Sparse0.8 | Sparse0.9 | Sparse1.0 | Int8-0.3 | Int8-0.5 | Int8-0.8 | Int8-0.9 | Int8-1.0 |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -117,11 +123,11 @@ Sparse Int8 的 topk 对比结果见图 2-4。在 `topk_ratio ∈ {0.3, 0.5, 0.8
 | 018 | 21.105 | 54.836 | 21.478 | 15.916 | 17.931 | 20.602 | 22.065 | 22.885 | 15.568 | 16.838 | 20.137 | 20.704 | 21.247 |
 | 019 | 20.721 | 53.988 | 21.756 | 15.831 | 17.370 | 20.801 | 22.125 | 23.031 | 15.943 | 16.811 | 20.113 | 20.759 | 21.330 |
 
-## 3. 任务 2：Attention Benchmark 结果
+## 3. 合成张量基准
 
-### 3.1 benchmark_attention.py 结果
+### 3.1 多后端结果
 
-Benchmark 设置为 `B=2`、fp16、warmup 10、iterations 50，测试 `N ∈ {2048,4096,8192,16384}`、`H ∈ {8,16}`、`D ∈ {64,128}`。下表列出脚本中所有后端在不同 `(H,N,D)` 下的速度和精度结果。Speedup 定义为 `time_SDPA / time_backend`。
+配置为 B=2、FP16、预热 10 次、计时 50 次，遍历 N∈{2048,4096,8192,16384}、H∈{8,16}、D∈{64,128}，共 16 种形状。Speedup 定义为 T_SDPA / T_backend，大于 1 表示加速。Vanilla 未启用，不包含在此表中。
 
 | H | N | D | Backend | Time ms | Speedup | CosSim | RelL1 | RMSE |
 |---:|---:|---:|---|---:|---:|---:|---:|---:|
@@ -318,42 +324,21 @@ Benchmark 设置为 `B=2`、fp16、warmup 10、iterations 50，测试 `N ∈ {20
 | 16 | 16384 | 128 | sparse_int8(topk=0.9) | 218.541 | 1.27x | 0.953030 | 3.18e-01 | 4.14e-03 |
 | 16 | 16384 | 128 | sparse_int8(topk=1.0) | 245.049 | 1.13x | 0.999918 | 1.28e-02 | 1.66e-04 |
 
-**图 3-1 Benchmark speedup**：`H=16,D=64` 配置下各 attention 后端相对 SDPA 的 speedup 对比。
+**图 3-1：H=16、D=64 时各后端相对 SDPA 的加速比。**
 
-![Benchmark speedup](../pic/benchmark_speedup_h16_d64.png)
+![相对 SDPA 的加速比](../pic/benchmark_speedup_h16_d64.png)
 
+### 3.2 数值误差与效率
 
-### 3.2 达标情况
+在表中精度下，Triton FA2 与全块 Sparse 的 CosSim 均显示为 1.000000，RelL1 最大为 5.22e-05；显示值为 1 不意味着输出逐元素完全一致。全块 Sparse Int8 仍有量化误差，RelL1 约为 1.2e-02 至 1.3e-02。
 
-#### 3.2.1 速度达标
+降低块保留比例会增大相对稠密 SDPA 的误差。topk=0.8 时，Sparse 与 Sparse Int8 的 CosSim 均约为 0.90，属于有损近似。误差需要结合块裁剪与量化共同解释。
 
-速度方面，`benchmark_attention.py` 中所有被测后端在 16 个 `(H,N,D)` 配置下均满足“不低于 SDPA 40%”的要求。全部结果中的最低 speedup 为 `0.597x`，出现在短序列配置 `H=8,N=2048,D=128` 的 `sparse_int8(topk=0.3)`；该值仍高于 `0.4x` 的速度阈值。
+时延收益随形状变化。部分短序列配置中 Sparse Int8 慢于 FP16 Sparse；部分大头维度配置中 Triton FA2 或全块 Sparse 也未快于 SDPA。因此不能依据单一配置宣称某后端始终更快。
 
-| 后端 | 速度阈值 | 结果 |
-|---|---|---|
-| Triton FA2 | speedup ≥ `0.4x` | 16 个配置全部达标，最小 speedup 为 `0.964x`。 |
-| Sparse topk=1.0 | speedup ≥ `0.4x` | 16 个配置全部达标，最小 speedup 为 `0.950x`。 |
-| Sparse topk=0.8 | speedup ≥ `0.4x` | 16 个配置全部达标，最小 speedup 为 `1.14x`。 |
-| Sparse Int8 topk=1.0 | speedup ≥ `0.4x` | 16 个配置全部达标，最小 speedup 为 `1.04x`。 |
-| Sparse Int8 topk=0.8 | speedup ≥ `0.4x` | 16 个配置全部达标，最小 speedup 为 `0.91x`。 |
+### 3.3 Sparse Int8 长序列比较
 
-少数短序列配置中，`topk=0.8` 相比 `topk=1.0` 的 kernel 计时没有严格更快，主要原因是 block selection、量化和 kernel launch 等固定开销占比较高。在 `N>=4096` 以及 T2I 主实验中，降低 topk 带来的速度收益更稳定。
-
-#### 3.2.2 精度达标
-
-精度方面，FA2 与 Sparse topk=1.0 的 CosSim 均为 `1.000000`，RelL1 远低于 `1e-3`；Sparse topk=0.8 的 CosSim 均高于 `0.8`，RelL1 均低于 `1.0`；Sparse Int8 topk=1.0 的 CosSim 均高于 `0.99`，RelL1 均低于 `2e-2`；Sparse Int8 topk=0.8 的 CosSim 和 RelL1 也满足稀疏近似设置下的要求。
-
-| 后端 | 精度阈值 | 结果 |
-|---|---|---|
-| Triton FA2 | CosSim > `0.99`，RelL1 < `1e-3` | 16 个配置全部达标，CosSim 均为 `1.000000`，最大 RelL1 为 `5.22e-05`。 |
-| Sparse topk=1.0 | CosSim > `0.99`，RelL1 < `1e-3` | 16 个配置全部达标，CosSim 均为 `1.000000`，最大 RelL1 为 `5.22e-05`。 |
-| Sparse topk=0.8 | CosSim > `0.8`，RelL1 < `1.0` | 16 个配置全部达标，最小 CosSim 为 `0.8995`，最大 RelL1 为 `0.488`。 |
-| Sparse Int8 topk=1.0 | CosSim > `0.99`，RelL1 < `2e-2` | 16 个配置全部达标，最小 CosSim 为 `0.999916`，最大 RelL1 为 `0.01286`。 |
-| Sparse Int8 topk=0.8 | CosSim > `0.8`，RelL1 < `1.0` | 16 个配置全部达标，最小 CosSim 为 `0.899439`，最大 RelL1 为 `0.488`。 |
-
-### 3.3 test_sparse_int8.py 长序列加速
-
-测试配置为 `B=2,H=16,D=64,topk=0.8,dtype=fp16,warmup=10,iters=30`。
+配置为 B=2、H=16、D=64、topk=0.8、dtype=fp16、warmup=10、iters=30。这里的 Speedup 为 T_sparse / T_sparse_int8，与上一节的速度基准不同；数值指标仍以 SDPA 为参考。
 
 | N | Sparse fp16 ms | Sparse Int8 ms | Speedup | CosSim | RelL1 | RMSE |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -364,59 +349,30 @@ Benchmark 设置为 `B=2`、fp16、warmup 10、iterations 50，测试 `N ∈ {20
 | 16384 | 85.740 | 60.166 | 1.43x | 0.901004 | 4.83e-01 | 6.33e-03 |
 | 32768 | 350.490 | 237.585 | 1.48x | 0.901479 | 4.82e-01 | 4.48e-03 |
 
-**图 3-2 Sparse Int8 long sequence speedup**：长序列设置下 Sparse Int8 相对 fp16 Sparse 的加速效果。
+**图 3-2：Sparse Int8 相对 FP16 Sparse 的长序列加速比。**
 
-![Sparse int8 long sequence speedup](../pic/sparse_int8_long_seq_speedup.png)
+![Sparse Int8 长序列加速比](../pic/sparse_int8_long_seq_speedup.png)
 
-`N=16384` 时 speedup 为 `1.43x`，满足作业要求的 `>=1.20x`。随着序列长度继续增加，int8 的 speedup 提升到 `1.48x`。
+N=16384 和 N=32768 的加速比分别为 1.43×、1.48×。最小被测长度 N=1024 已记录 1.04×，但缺少更短序列与重复测量，不能确定真实加速交叉点。随 N 增长的收益也并非严格单调。
 
-## 4. 结果分析
+## 4. 分析
 
-### 4.1 Flash Attention 2 为什么比 Vanilla Attention 更快
+### 4.1 分块稠密注意力
 
-Vanilla Attention 会显式构造完整的 `N x N` attention score 矩阵，然后再进行 softmax 和矩阵乘法。这种方式会产生大量 HBM 读写，并且中间矩阵占用显存较多。Flash Attention 2 采用分块计算和 online softmax，只在片上 SRAM 中保留当前 block 和累积统计量，不需要保存完整 attention matrix。因此它减少了显存访问次数，提高了计算和访存效率。
+Vanilla 显式构造完整矩阵，产生二次方级中间存储与多次显存读写。分块计算和在线 softmax 避免保存完整矩阵，并维护逐行归一化统计量。该设计解释了 Triton FA2 相对 Vanilla 的效率改善；其与 SDPA 的相对性能仍依赖具体调度与形状。
 
-本实验中，Vanilla 的 T2I 平均采样时间为 `54.203s/image`，Triton FA2 为 `22.001s/image`。两者生成质量接近，但 FA2 的速度明显更好。
+### 4.2 块稀疏近似
 
-### 4.2 Block-Sparse 的速度-质量平衡点
+块选择减少参与计算的 K/V 块，但块均值评分、top-k 与索引构建也有成本。在矩阵乘占主要时间的配置下，减少块数更容易获得收益；短序列中固定开销占比较高。本实验未进行逐内核 profiling，因此该解释是与实现和现象一致的机制分析，并非对时间占比的直接测量。
 
-Block-Sparse 的速度收益来自减少参与计算的 K/V blocks。topk 越低，计算量越小，但图像质量也越容易受到影响。根据 T2I 结果：
+### 4.3 Int8 量化
 
-- `topk=0.3` 最快，平均 `15.589s/image`，但图像构图变化较明显。
-- `topk=0.5` 平均 `17.792s/image`，相比 `topk=1.0` 快约 `22.2%`，同时仍能保持 prompt 的主体语义。
-- `topk=0.8/0.9` 质量更接近 dense attention，但速度收益明显下降。
+Q/K 量化减少相关数据读写量，并允许 QK 使用 Int8 矩阵乘；PV 仍为浮点运算，不能将整个注意力计算视为 Int8。短序列中量化、scale 计算与额外 kernel launch 可能抵消收益。序列更长时，QK 的计算节省可能超过这些成本。
 
-综合生成效果和速度，本实验认为 `topk=0.5` 是 PixArt-Alpha T2I 场景下较合适的折中点。
+例如 H=8、N=2048、D=128、topk=0.8 时，FP16 Sparse 为 2.001 ms，Sparse Int8 为 2.624 ms；固定 H=16、D=64 的长序列比较则记录了加速。量化收益依赖工作负载，不能仅由数据类型推断。
 
-### 4.3 Int8 量化短序列慢、长序列快的原因
+## 5. 结论与局限
 
-**为什么短序列时 int8 反而比 fp16 慢？** Sparse Int8 的耗时主要包括 Q/K 量化、block selection 和 int8 attention kernel 三部分。短序列时 attention 的矩阵乘计算量还不大，fp16 sparse kernel 本身已经很快；此时 Q/K per-block 量化、scale 计算、数据转换以及 kernel launch 等固定开销占比较高，int8 tensor core 节省下来的计算时间不足以抵消这些额外开销。因此在部分短序列配置中，int8 会反而慢于 fp16，例如 `H=8,N=2048,D=128,topk=0.8` 时，fp16 sparse 为 `2.001 ms`，sparse int8 为 `2.624 ms`。
+分块稠密计算在维持较小数值误差的同时改善了相对 Vanilla 的效率；块稀疏提供可调节的时间与近似误差权衡；Q/K Int8 量化在部分长序列配置中进一步加速。
 
-**为什么长序列时 int8 能加速？** 随着 `N` 增大，attention 的主要开销转向 QK 和 PV 两类大规模矩阵乘，计算量和访存量都快速增长。int8 的优势主要来自两方面：一是 Q/K 使用 int8 后读写数据量更小，降低了 HBM 访存带宽压力；二是 int8 矩阵乘可以利用 GPU tensor core 的更高吞吐，在长序列下能显著降低 attention kernel 的计算时间。此时固定量化开销被更大的 attention 计算量摊薄，所以 sparse int8 相比 fp16 sparse 的加速更加明显。
-
-**从实验数据看，int8 加速的拐点在哪里？** 在 `test_sparse_int8.py` 的长序列实验中，speedup 定义为 `time_fp16 / time_int8`。本次数据里 `N=1024` 时 speedup 已经达到 `1.04x`，因此按照“首次 speedup > 1.0”的定义，int8 加速拐点是 `N=1024`。如果从更稳定、幅度更明显的加速来看，`N=2048` 时 speedup 为 `1.46x`，之后在 `N=4096,8192,16384,32768` 上均保持大于 `1.0`，并在 `N=16384` 达到 `1.43x`、`N=32768` 达到 `1.48x`，满足 `N>=16384` 时至少 `1.20x` 加速的要求。
-
-## 5. 总结
-
-### 5.1 有效设计
-
-- **Triton Flash Attention 2 的分块计算和 online softmax 是最稳定有效的 dense attention 优化。** 它不改变 attention 的数学形式，FA2 与 SDPA 的 CosSim 为 `1.000000`，同时避免显式保存完整 `N x N` attention matrix，显著减少 HBM 读写。T2I 中 FA2 平均 `22.001s/image`，远快于 Vanilla 的 `54.203s/image`，并且满足速度阈值。
-- **Block-Sparse Attention 的 block selection 能有效提供速度-质量折中。** 降低 `topk_ratio` 会减少参与计算的 K/V blocks，`topk=0.5` 相比 `topk=1.0` 快约 `22.2%`，同时仍能保持 prompt 的主体语义；`topk=0.8/0.9` 的质量更接近 dense attention。
-- **Sparse Int8 的 Q/K per-block 量化在长序列上有效。** 当 `N=16384` 时，Sparse Int8 相比 fp16 Sparse 达到 `1.43x` speedup，超过 `1.20x` 要求；随着 `N` 增大到 `32768`，speedup 进一步提升到 `1.48x`。
-- **Vanilla Attention 主要有效价值是正确性参考。** 它实现简单、语义清楚，适合验证公式和生成质量，但显式构造 attention matrix，速度明显不适合作为高性能推理后端。
-
-### 5.2 适用场景
-
-| 设计 | 更适合的场景 | 不适合或收益有限的场景 |
-|---|---|---|
-| Vanilla Attention | 小规模调试、正确性 baseline、对照 SDPA 数值行为 | 实际 T2I 推理和长序列 benchmark，显存访问和中间矩阵开销过大 |
-| Triton Flash Attention 2 | 需要保持 dense attention 精度、生成质量要求高、希望接近或优于 SDPA 速度的通用场景 | 如果需要进一步牺牲少量质量换取更大速度收益，仅 dense 优化不够 |
-| Block-Sparse Attention | 允许轻微质量变化、希望通过 `topk_ratio` 控制速度-质量平衡的 T2I 或长序列场景；本实验中 `topk=0.5` 是较好的 T2I 折中点 | `topk=0.3` 过稀疏时容易丢失纹理、背景连续性和小物体细节 |
-| Sparse Int8 Attention | `N >= 16384` 等长序列、QK 计算和访存成为主要瓶颈、硬件 int8 tensor core 能充分发挥的场景 | PixArt-Alpha 当前短序列 T2I 中收益有限，因为量化、scale 计算和 kernel launch 等固定开销占比较高 |
-
-### 5.3 主要观察
-
-- **Attention 优化不是单一维度问题，而是“访存、计算量、近似误差、固定开销”的共同权衡。** FA2 主要优化访存模式，Sparse 主要减少计算 blocks，Int8 主要提升长序列矩阵乘吞吐。
-- **稀疏度越高，速度通常越快，但质量下降首先体现在细节层面。** `topk=0.3` 容易出现纹理丢失、背景不连续和局部伪影；`topk=0.8/0.9` 与 `topk=1.0` 在两个示例 prompt 上视觉差异很小，但速度收益也更小。
-- **短序列和长序列的最优后端不同。** 短序列下 fixed overhead 会削弱 sparse/int8 的优势；长序列下 QK/PV 的计算和访存占主导，Sparse Int8 的收益更明显。
-- **高性能 attention 后端需要按任务选择。** 如果目标是最高保真，应优先使用 SDPA/FA2 或 Sparse `topk=1.0/0.9`；如果目标是 T2I 推理速度与质量折中，可选 Sparse `topk=0.5`；如果目标是长序列吞吐，应优先考虑 Sparse Int8。
+证据范围限于既有单次测量、固定提示词与合成张量形状。未报告跨设备测量、独立重复统计、真实模型激活上的算子误差或标准化生成质量指标。公开版本不附带原始运行目录，表格与图像应作为已记录结果阅读，而非完整原始日志档案。进一步验证可增加重复试验、明确驱动与运行时版本，并分别测量内核、采样和端到端耗时。

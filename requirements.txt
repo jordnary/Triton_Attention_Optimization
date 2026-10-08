@@ -1,16 +1,15 @@
 # =============================================================================
-# ENV_NAME environment — cleaned dependency list
+# Dependency versions retained from the experiment configuration
 # Python 3.12, CUDA 12.6, for PixArt-alpha T2I inference + Triton attention
 #
 # Install core deps with:
 #   pip install -r requirements.txt
 #
 # Notes:
-#  - torch/torchvision/triton are CUDA 12.6 builds (+cu126). Install from the
-#    appropriate index, e.g.:
+#  - Install the CUDA 12.6 PyTorch and torchvision wheels separately:
 #      pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu126
-#  - The nvidia-* CUDA runtime wheels below are pulled in automatically by
-#    torch; they are listed only for exact reproduction and can be omitted.
+#  - Triton has its own version pin; it does not use the +cu126 suffix.
+#  - This list is not a fully resolved or cross-platform validated lockfile.
 # =============================================================================
 
 # ---- Core deep learning ----
