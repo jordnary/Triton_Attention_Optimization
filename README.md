@@ -2,7 +2,7 @@
 
 本项目研究注意力计算中的访存开销、块稀疏近似与低精度量化，基于 PyTorch 和 Triton 实现四种 Attention 后端，并在 PixArt-α 文生图推理与合成张量基准中评估其计算效率和数值误差。
 
-仓库保留实现代码、复现说明、测试提示词、匿名化实验报告及报告图表。模型权重、文本嵌入、逐次运行输出和本地 PDF 不纳入版本控制。
+仓库提供实现代码、复现说明、测试提示词、实验报告与配套图表。模型权重、文本嵌入和逐次运行输出需在本地准备或生成。
 
 ## 方法与实现范围
 
@@ -86,8 +86,7 @@ python test_t2i.py --attention_mode sparse_int8 --topk_ratio 0.5
 | `data/test.txt` | 20 个公开测试提示词 |
 | `data/env_install.md` | 环境配置 |
 | `data/task1.md`、`data/task2.md` | 文生图与算子评估方法 |
-| `doc/report.md`、`pic/` | 匿名化报告及配套图表 |
-| `doc/publishing.md` | 公开文件范围与发布方法 |
+| `doc/report.md`、`pic/` | 实验报告及配套图表 |
 
 ## 复现边界
 
